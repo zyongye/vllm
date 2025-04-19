@@ -14,6 +14,10 @@ from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.deep_gemm_moe import (
     _valid_deep_gemm, deep_gemm_moe_fp8)
+from vllm.model_executor.layers.fused_moe.exp_fused_moe.matmul_ogs import (
+    matmul_ogs)
+from vllm.model_executor.layers.fused_moe.exp_fused_moe.routing import (
+    GatherIndx, RoutingData, ScatterIndx)
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -885,7 +889,7 @@ def fused_topk(
 
 
 # This is used by the Deepseek-V2 and Deepseek-V3 model
-@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
+# @torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
 def grouped_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1172,6 +1176,103 @@ def fused_experts(hidden_states: torch.Tensor,
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             block_shape=block_shape)
+
+
+# This is a triton implementation of the fused_experts function
+def fused_experts_triton_exp(hidden_states: torch.Tensor,
+                             w1: torch.Tensor,
+                             w2: torch.Tensor,
+                             routing_data: RoutingData,
+                             gather_indx: GatherIndx,
+                             scatter_indx: ScatterIndx,
+                             inplace: bool = False,
+                             activation: str = "silu",
+                             apply_router_weight_on_input: bool = False,
+                             use_fp8_w8a8: bool = False,
+                             use_int8_w8a8: bool = False,
+                             use_int8_w8a16: bool = False,
+                             use_int4_w4a16: bool = False,
+                             per_channel_quant: bool = False,
+                             global_num_experts: int = -1,
+                             expert_map: Optional[torch.Tensor] = None,
+                             w1_scale: Optional[torch.Tensor] = None,
+                             w2_scale: Optional[torch.Tensor] = None,
+                             w1_zp: Optional[torch.Tensor] = None,
+                             w2_zp: Optional[torch.Tensor] = None,
+                             a1_scale: Optional[torch.Tensor] = None,
+                             a2_scale: Optional[torch.Tensor] = None,
+                             block_shape: Optional[List[int]] = None,
+                             allow_deep_gemm: bool = False) -> torch.Tensor:
+
+    # type check
+    assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
+    assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
+    assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
+
+    # Shape check
+    assert hidden_states.ndim == 2, "hidden_states must be 2D"
+    assert hidden_states.shape[-1] == w1.shape[
+        -1], "hidden_states shape[-1] must be equal to w1 shape[-1]"
+    assert w1.shape[-1] == w2.shape[
+        1], "w1 shape[-1] must be equal to w2 shape[1]"
+
+    # feature check
+    assert inplace == False, "Inplace is not supported in new triton MoE kernel"
+    assert apply_router_weight_on_input == False, "apply_router_weight_on_input is not supported in new triton MoE kernel"
+    assert use_fp8_w8a8 == False, "use_fp8_w8a8 is not supported in new triton MoE kernel"
+    assert use_int8_w8a8 == False, "use_int8_w8a8 is not supported in new triton MoE kernel"
+    assert use_int8_w8a16 == False, "use_int8_w8a16 is not supported in new triton MoE kernel"
+    assert use_int4_w4a16 == False, "use_int4_w4a16 is not supported in new triton MoE kernel"
+    assert per_channel_quant == False, "per_channel_quant is not supported in new triton MoE kernel"
+    assert global_num_experts == -1, "global_num_experts is not supported in new triton MoE kernel"
+    assert expert_map is None, "expert_map is not supported in new triton MoE kernel"
+    assert w1_scale is None, "w1_scale is not supported in new triton MoE kernel"
+    assert w2_scale is None, "w2_scale is not supported in new triton MoE kernel"
+    assert w1_zp is None, "w1_zp is not supported in new triton MoE kernel"
+    assert w2_zp is None, "w2_zp is not supported in new triton MoE kernel"
+    assert a1_scale is None, "a1_scale is not supported in new triton MoE kernel"
+    assert a2_scale is None, "a2_scale is not supported in new triton MoE kernel"
+    assert block_shape is None, "block_shape is not supported in new triton MoE kernel"
+    assert allow_deep_gemm == False, "allow_deep_gemm is not supported in new triton MoE kernel"
+
+    M, K = hidden_states.shape
+    N = w1.shape[1]
+    n_expts_tot = routing_data.n_expts_tot
+    n_expts_act = routing_data.n_expts_act
+
+    w1 = w1.transpose(-2, -1).contiguous()
+    w2 = w2.transpose(-2, -1).contiguous()
+
+    # consistent with default implementation
+    intermediate_cache2 = torch.empty((M * n_expts_act, N // 2),
+                                      device="cuda",
+                                      dtype=torch.bfloat16)
+    out_hidden_states = torch.empty_like(hidden_states)
+
+    intermediate_cache1 = matmul_ogs(hidden_states, w1, None, routing_data,
+                                     gather_indx)
+
+    if activation == "silu":
+        torch.ops._C.silu_and_mul(intermediate_cache2,
+                                  intermediate_cache1.view(-1, N))
+    elif activation == "gelu":
+        torch.ops._C.gelu_and_mul(intermediate_cache2,
+                                  intermediate_cache1.view(-1, N))
+    else:
+        raise ValueError(f"Unsupported FusedMoe activation: {activation}")
+
+    intermediate_cache3 = matmul_ogs(intermediate_cache2, w2, None,
+                                     routing_data, None)
+    wintermediate_cache3 = intermediate_cache3 * routing_data.gate_scal[:,
+                                                                        None]
+
+    wintermediate_cache3 = wintermediate_cache3[scatter_indx.src_indx].reshape(
+        M, -1, K)
+
+    ops.moe_sum(wintermediate_cache3.view(*wintermediate_cache3.shape),
+                out_hidden_states)
+
+    return out_hidden_states
 
 
 def moe_kernel_prepare_input(
