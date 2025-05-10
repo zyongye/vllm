@@ -6,6 +6,7 @@ from typing import Iterable, List, Set, Tuple
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.model_executor import SamplingMetadata
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -69,7 +70,10 @@ class MLPSpeculator(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        config = vllm_config.model_config.hf_config
+        if envs.VLLM_USE_V1:
+            config = vllm_config.speculative_config.draft_model_config.hf_config
+        else:
+            config = vllm_config.model_config.hf_config
         self.n_predict = config.n_predict
         self.vocab_size = config.vocab_size
         self.emb_dim = config.emb_dim
@@ -181,8 +185,9 @@ class MLPSpeculator(nn.Module):
             # TODO: not yet supporting top_k_tokens_per_head
             states = states.flatten(0, 1)
 
-            logits = self.logits_processor(self.head[head_index], states,
-                                           sampling_metadata)
+            logits = self.logits_processor(
+                self.head[head_index], states,
+                None if envs.VLLM_USE_V1 else sampling_metadata)
 
             output = self.sampler(logits, sampling_metadata)
             last_tokens = output.sampled_token_ids
