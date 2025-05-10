@@ -1423,6 +1423,7 @@ class EngineArgs:
         # Only Ngram speculative decoding so far.
         is_ngram_enabled = False
         is_eagle_enabled = False
+        is_medusa_enabled = False
         if self.speculative_config is not None:
             # This is supported but experimental (handled below).
             speculative_method = self.speculative_config.get("method")
@@ -1431,11 +1432,13 @@ class EngineArgs:
                     is_ngram_enabled = True
                 elif speculative_method in ("eagle", "eagle3"):
                     is_eagle_enabled = True
+                elif speculative_method in ("medusa"):
+                    is_medusa_enabled = True
             else:
                 speculative_model = self.speculative_config.get("model")
                 if speculative_model in ("ngram", "[ngram]"):
                     is_ngram_enabled = True
-            if not (is_ngram_enabled or is_eagle_enabled):
+            if not (is_ngram_enabled or is_eagle_enabled or is_medusa_enabled):
                 # Other speculative decoding methods are not supported yet.
                 _raise_or_fallback(feature_name="Speculative Decoding",
                                    recommend_to_remove=False)

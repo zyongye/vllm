@@ -52,6 +52,16 @@ def model_name():
     return "meta-llama/Llama-3.1-8B-Instruct"
 
 
+@pytest.fixture
+def medusa_model_name():
+    return "JackFram/llama-68m"
+
+
+@pytest.fixture
+def medusa_draft_model_name():
+    return "abhigoyal/vllm-medusa-llama-68m-random"
+
+
 def eagle_model_name():
     return "yuhuili/EAGLE-LLaMA3.1-Instruct-8B"
 
@@ -151,3 +161,59 @@ def test_eagle_correctness(
         # Upon failure, inspect the outputs to check for inaccuracy.
         assert matches > int(0.66 * len(ref_outputs))
         del spec_llm
+
+
+def test_medusa_correctness(monkeypatch: pytest.MonkeyPatch,
+                            test_prompts: list[list[dict[str, Any]]],
+                            sampling_config: SamplingParams,
+                            medusa_model_name: str,
+                            medusa_draft_model_name: str):
+    '''
+    Compare the outputs of a original LLM and a speculative LLM
+    should be the same when using medusa speculative decoding.
+    '''
+
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_USE_V1", "1")
+
+        with open('../../../examples/template_falcon_180b.jinja') as f:
+            chat_template = f.read()
+
+        ref_llm = LLM(model=medusa_model_name, max_model_len=2048)
+        ref_outputs = ref_llm.chat(test_prompts,
+                                   sampling_config,
+                                   chat_template=chat_template)
+        del ref_llm
+
+        spec_llm = LLM(
+            model=medusa_model_name,
+            trust_remote_code=True,
+            speculative_config={
+                "method": "medusa",
+                "model": medusa_draft_model_name,
+                "num_speculative_tokens": 5,
+            },
+            max_model_len=2048,
+        )
+        spec_outputs = spec_llm.chat(test_prompts,
+                                     sampling_config,
+                                     chat_template=chat_template)
+        matches = 0
+        misses = 0
+        for ref_output, spec_output in zip(ref_outputs, spec_outputs):
+            if ref_output.outputs[0].text == spec_output.outputs[0].text:
+                matches += 1
+            else:
+                misses += 1
+                print(f"ref_output: {ref_output.outputs[0].text}")
+                print(f"spec_output: {spec_output.outputs[0].text}")
+
+        # Heuristic: expect at least 66% of the prompts to match exactly
+        # Upon failure, inspect the outputs to check for inaccuracy.
+        assert matches > int(0.66 * len(ref_outputs))
+        del spec_llm
+
+
+if __name__ == "__main__":
+    import pytest
+    pytest.main([__file__])

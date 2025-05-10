@@ -2374,7 +2374,7 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ('eagle', 'eagle3'):
+                if self.method in ('eagle', 'eagle3', 'medusa'):
                     pass
                 elif "eagle-" in self.draft_model_config.model.lower() or \
                         "eagle3-" in self.draft_model_config.model.lower():

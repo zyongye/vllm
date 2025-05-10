@@ -40,6 +40,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.medusa_proposer import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.utils import is_spec_decode_supported
@@ -171,6 +172,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if get_pp_group().is_last_rank:
                 if self.speculative_config.method == "ngram":
                     self.drafter = NgramProposer(self.vllm_config)
+                elif self.speculative_config.method == "medusa":
+                    self.drafter = MedusaProposer(self.vllm_config)
                 elif self.speculative_config.use_eagle():
                     self.drafter = EagleProposer(self.vllm_config,
                                                  self.device)  # type: ignore
@@ -1198,6 +1201,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert isinstance(self.drafter, NgramProposer)
             spec_token_ids = self.generate_draft_token_ids(
                 valid_sampled_token_ids, sampling_metadata)
+        elif self.speculative_config.method == "medusa":
+            assert isinstance(self.drafter, MedusaProposer)
+            accepted_token_hidden_offset = torch.tensor(
+                [len(t) - 1 for t in valid_sampled_token_ids],
+                device=self.device)
+            if spec_decode_metadata is None:
+                valid_token_hidden_state = sample_hidden_states
+            else:
+                target_hidden_state_indices_base = spec_decode_metadata.bonus_logits_indices - torch.tensor(
+                    spec_decode_metadata.num_draft_tokens, device=self.device)
+                target_hidden_state_indices = target_hidden_state_indices_base + accepted_token_hidden_offset
+                valid_token_hidden_state = sample_hidden_states[
+                    target_hidden_state_indices]
+            draft_token_ids = self.drafter.propose(
+                previous_hidden_states=valid_token_hidden_state,
+                sampling_metadata=sampling_metadata)
+            spec_token_ids = draft_token_ids.tolist()
         elif self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
             # TODO(woosuk): Refactor the loop.

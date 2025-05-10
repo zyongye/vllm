@@ -5,6 +5,7 @@ from typing import Iterable, List, Optional, Set, Tuple
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.sampler import SamplerOutput
@@ -50,7 +51,10 @@ class Medusa(nn.Module):
        needs to have truncated_vocab_size (=k) as an attribute."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        config = vllm_config.model_config.hf_config
+        if envs.VLLM_USE_V1:
+            config = vllm_config.speculative_config.draft_model_config.hf_config
+        else:
+            config = vllm_config.model_config.hf_config
         super().__init__()
         self.config = config
         self.blocks = nn.ModuleList([
