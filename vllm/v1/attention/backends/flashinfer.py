@@ -10,7 +10,6 @@ import torch
 from flashinfer import (BatchDecodeWithPagedKVCacheWrapper,
                         BatchPrefillWithPagedKVCacheWrapper,
                         MultiLevelCascadeAttentionWrapper)
-from flashinfer.decode import trtllm_batch_decode_with_kv_cache
 
 import vllm.envs as envs
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
@@ -108,6 +107,9 @@ class FlashInferBackend(AttentionBackend):
         num_kv_heads: int,
         attn_head_size: int,
     ) -> bool:
+        # TODO: need to override the layout if trtllm-gen is actually available, or make trtllm-gen backend support NHD layout
+        if get_kv_cache_layout() == "NHD":
+            return False
         if FlashInferBackend.cached_sm100a_supported is None:
             FlashInferBackend.cached_sm100a_supported = (
                 current_platform.has_device_capability(100))
@@ -139,6 +141,51 @@ class FlashInferBackend(AttentionBackend):
             if use_trtllm:
                 logger.warning_once(
                     "Using TRTLLM decode attention (auto-detected).")
+        return use_trtllm
+
+    @staticmethod
+    def use_trtllm_context_attention(
+        batch_size: int,
+        max_seq_len: int,
+        kv_cache_dtype: str,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        attn_head_size: int,
+    ) -> bool:
+        # TODO: need to override the layout if trtllm-gen is actually available, or make trtllm-gen backend support NHD layout
+        if get_kv_cache_layout() == "NHD":
+            return False
+        if FlashInferBackend.cached_sm100a_supported is None:
+            FlashInferBackend.cached_sm100a_supported = (
+                current_platform.has_device_capability(100))
+        if not FlashInferBackend.cached_sm100a_supported:
+            return False
+        if (num_qo_heads // num_kv_heads > 8
+                or num_qo_heads % num_kv_heads != 0 or attn_head_size != 128):
+            return False
+        env_value = envs.VLLM_USE_TRTLLM_CONTEXT_ATTENTION
+        if env_value is not None:
+            logger.info_once("VLLM_USE_TRTLLM_CONTEXT_ATTENTION is set to %s",
+                             env_value)
+            # Environment variable is set - respect it
+            # Making the conditional check for zero because
+            # the path is automatically enabled if the batch size condition
+            # is satisfied.
+            no_use_trtllm = env_value == "0"
+            if not no_use_trtllm:
+                logger.info_once(
+                    "VLLM_USE_TRTLLM_CONTEXT_ATTENTION is set to 1, "
+                    "using TRTLLM context attention.")
+            return not no_use_trtllm
+        else:
+            # Environment variable not set - use auto-detection
+            # Only supports attention head size of 128
+            use_trtllm = (FlashInferBackend.cached_sm100a_supported
+                          and batch_size <= 256 and max_seq_len < 131072
+                          and kv_cache_dtype == "auto")
+            if use_trtllm:
+                logger.warning_once(
+                    "Using TRTLLM context attention (auto-detected).")
         return use_trtllm
 
     @staticmethod
@@ -255,13 +302,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 device=self.device)
         return self._workspace_buffer
 
-    def _get_prefill_wrapper(self):
+    def _get_prefill_wrapper(self, backend: str = 'auto'):
         if self._prefill_wrapper is None:
             self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                self._get_workspace_buffer(), get_kv_cache_layout())
+                self._get_workspace_buffer(), get_kv_cache_layout(), backend=backend)
         return self._prefill_wrapper
 
-    def _get_decode_wrapper(self):
+    def _get_decode_wrapper(self, backend: str = 'auto'):
         if self._decode_wrapper is None:
             num_qo_heads = (
                 self.vllm_config.model_config.get_num_attention_heads(
@@ -273,7 +320,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self._decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 self._get_workspace_buffer(),
                 get_kv_cache_layout(),
-                use_tensor_cores=use_tensor_cores)
+                use_tensor_cores=use_tensor_cores,
+                backend=backend)
         return self._decode_wrapper
 
     def _get_cascade_wrapper(self):
@@ -323,10 +371,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # Decodes are at the front and prefills are at the back,
             # according to reorder_batch()
             if num_prefills > 0:
+                use_trtllm_context_attention = FlashInferBackend.use_trtllm_context_attention(
+                    num_prefills, attn_metadata.max_seq_len,
+                    self.cache_config.cache_dtype,
+                    attn_metadata.num_qo_heads, attn_metadata.num_kv_heads,
+                    attn_metadata.head_dim)
                 # Decodes are first so prefills start after the last decode
                 prefill_start = num_decodes
-                attn_metadata.prefill_wrapper = self._get_prefill_wrapper()
-                assert attn_metadata.qo_indptr_cpu[prefill_start:].shape[
+                attn_metadata.prefill_wrapper = self._get_prefill_wrapper(
+                    backend="trtllm-gen" if use_trtllm_context_attention else 'auto')
+                assert attn_metadata.qo_indptr[prefill_start:].shape[
                     0] == num_prefills + 1
                 assert attn_metadata.paged_kv_indptr_cpu[prefill_start:].shape[
                     0] == num_prefills + 1
@@ -353,32 +407,36 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     logits_soft_cap,
                     q_data_type=attn_metadata.q_data_type,
                     kv_data_type=attn_metadata.kv_data_type,
+                    seq_lens=attn_metadata.seq_lens[prefill_start:],
+                    block_tables=attn_metadata.block_table_tensor[prefill_start:],
                 )
 
             if num_decodes > 0:
-                attn_metadata.decode_wrapper = self._get_decode_wrapper()
-                if not FlashInferBackend.use_trtllm_decode_attention(
+                use_trtllm_decode_attention = FlashInferBackend.use_trtllm_decode_attention(
                         num_decodes, attn_metadata.max_seq_len,
                         self.cache_config.cache_dtype,
                         attn_metadata.num_qo_heads, attn_metadata.num_kv_heads,
-                        attn_metadata.head_dim):
-                    attn_metadata.decode_wrapper.plan(
-                        attn_metadata.paged_kv_indptr_cpu[:num_decodes + 1],
-                        attn_metadata.paged_kv_indices,
-                        attn_metadata.paged_kv_last_page_len_cpu[:num_decodes],
-                        attn_metadata.num_qo_heads,
-                        attn_metadata.num_kv_heads,
-                        attn_metadata.head_dim,
-                        attn_metadata.page_size,
-                        # Disable flashinfer's pos encoding and use vllm's rope.
-                        pos_encoding_mode="NONE",
-                        sm_scale=self.global_hyperparameters.sm_scale,
-                        window_left=self.global_hyperparameters.window_left,
-                        logits_soft_cap=self.global_hyperparameters.
-                        logits_soft_cap,
-                        q_data_type=attn_metadata.q_data_type,
-                        kv_data_type=attn_metadata.kv_data_type,
-                    )
+                        attn_metadata.head_dim)
+                attn_metadata.decode_wrapper = self._get_decode_wrapper(backend="trtllm-gen" if use_trtllm_decode_attention else 'auto')
+                attn_metadata.decode_wrapper.plan(
+                    attn_metadata.paged_kv_indptr[:num_decodes + 1],
+                    attn_metadata.paged_kv_indices,
+                    attn_metadata.paged_kv_last_page_len[:num_decodes],
+                    attn_metadata.num_qo_heads,
+                    attn_metadata.num_kv_heads,
+                    attn_metadata.head_dim,
+                    attn_metadata.page_size,
+                    # Disable flashinfer's pos encoding and use vllm's rope.
+                    pos_encoding_mode="NONE",
+                    sm_scale=self.global_hyperparameters.sm_scale,
+                    window_left=self.global_hyperparameters.window_left,
+                    logits_soft_cap=self.global_hyperparameters.
+                    logits_soft_cap,
+                    q_data_type=attn_metadata.q_data_type,
+                    kv_data_type=attn_metadata.kv_data_type,
+                    seq_lens=attn_metadata.seq_lens[:num_decodes],
+                    block_tables=attn_metadata.block_table_tensor[:num_decodes],
+                )
 
     def build(self,
               common_prefix_len: int,
@@ -627,13 +685,21 @@ class FlashInferImpl(AttentionImpl):
             assert prefill_query.shape[0] == num_prefill_tokens
             assert prefill_wrapper is not None
             assert prefill_wrapper._causal
-            assert prefill_wrapper._window_left == window_left
-            assert prefill_wrapper._logits_soft_cap == (self.logits_soft_cap
-                                                        or 0.0)
-            assert prefill_wrapper._sm_scale == self.scale
+            if not FlashInferBackend.use_trtllm_context_attention(
+                    attn_metadata.num_prefills, attn_metadata.max_seq_len,
+                    self.kv_cache_dtype, attn_metadata.num_qo_heads,
+                    attn_metadata.num_kv_heads, attn_metadata.head_dim):
+                assert prefill_wrapper._window_left == window_left
+                assert prefill_wrapper._logits_soft_cap == (self.logits_soft_cap
+                                                            or 0.0)
+                assert prefill_wrapper._sm_scale == self.scale
             prefill_wrapper.run(
                 prefill_query,
                 kv_cache_permute,
+                window_left=window_left,
+                # TODO: need to update flashinfer to expose logits_soft_cap and sm_scale for trtllm-gen backend
+                # logits_soft_cap=self.logits_soft_cap,
+                # sm_scale=self.scale,
                 k_scale=layer._k_scale_float,
                 v_scale=layer._v_scale_float,
                 out=output[num_decode_tokens:],
@@ -641,47 +707,24 @@ class FlashInferImpl(AttentionImpl):
         if decode_wrapper := attn_metadata.decode_wrapper:
             decode_query = query[:num_decode_tokens]
             assert decode_query.shape[0] == num_decode_tokens
+            assert decode_wrapper is not None
             if not FlashInferBackend.use_trtllm_decode_attention(
                     attn_metadata.num_decodes, attn_metadata.max_seq_len,
                     self.kv_cache_dtype, attn_metadata.num_qo_heads,
                     attn_metadata.num_kv_heads, attn_metadata.head_dim):
-                assert decode_wrapper is not None
                 assert decode_wrapper._window_left == window_left
                 assert decode_wrapper._logits_soft_cap == (self.logits_soft_cap
-                                                           or 0.0)
-                assert decode_wrapper._sm_scale == self.scale
-                decode_wrapper.run(
-                    decode_query,
-                    kv_cache_permute,
-                    k_scale=layer._k_scale_float,
-                    v_scale=layer._v_scale_float,
-                    out=output[:num_decode_tokens],
-                )
-            else:
-                # This path needs to be enabled with VLLM_KV_CACHE_LAYOUT = HND
-                if num_decode_tokens > 0:
-                    # decode_query may be non-contiguous
-                    decode_query = decode_query.contiguous()
-                    block_tables_decode = attn_metadata.block_table_tensor[:
-                                                                           num_decode_tokens]
-                    seq_lens_decode = attn_metadata.seq_lens[:
-                                                             num_decode_tokens]
-
-                    assert get_kv_cache_layout() == "HND"
-                    assert decode_query.is_contiguous()
-                    assert kv_cache_permute.is_contiguous()
-                    assert block_tables_decode.is_contiguous()
-                    assert seq_lens_decode.is_contiguous()
-
-                    output[:num_decode_tokens] = (
-                        trtllm_batch_decode_with_kv_cache(
-                            query=decode_query,
-                            kv_cache=kv_cache_permute,
-                            workspace_buffer=attn_metadata.workspace_buffer,
-                            block_tables=block_tables_decode,
-                            seq_lens=seq_lens_decode,
-                            max_seq_len=attn_metadata.max_seq_len,
-                            bmm1_scale=layer._k_scale_float * self.scale,
-                            bmm2_scale=layer._v_scale_float,
-                        ))
+                                                        or 0.0)
+            assert decode_wrapper._sm_scale == self.scale
+            decode_wrapper.run(
+                decode_query,
+                kv_cache_permute,
+                window_left=window_left,
+                # TODO: need to update flashinfer to expose logits_soft_cap
+                # logits_soft_cap=self.logits_soft_cap,
+                # sm_scale=self.scale,
+                k_scale=layer._k_scale_float,
+                v_scale=layer._v_scale_float,
+                out=output[:num_decode_tokens],
+            )
         return output_padded
