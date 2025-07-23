@@ -116,7 +116,9 @@ class FlashInferBackend(AttentionBackend):
         if not FlashInferBackend.cached_sm100a_supported:
             return False
         if (num_qo_heads // num_kv_heads > 8
-                or num_qo_heads % num_kv_heads != 0 or attn_head_size != 128):
+                or num_qo_heads % num_kv_heads != 0):
+            logger.info_once("num_qo_heads, num_kv_heads, attn_head_size: %s, %s, %s don't meet trtllm-gen requirements",
+                             num_qo_heads, num_kv_heads, attn_head_size)
             return False
         env_value = envs.VLLM_USE_TRTLLM_DECODE_ATTENTION
         if env_value is not None:
@@ -161,7 +163,9 @@ class FlashInferBackend(AttentionBackend):
         if not FlashInferBackend.cached_sm100a_supported:
             return False
         if (num_qo_heads // num_kv_heads > 8
-                or num_qo_heads % num_kv_heads != 0 or attn_head_size != 128):
+                or num_qo_heads % num_kv_heads != 0):
+            logger.info_once("num_qo_heads, num_kv_heads, attn_head_size: %s, %s, %s don't meet trtllm-gen requirements",
+                             num_qo_heads, num_kv_heads, attn_head_size)
             return False
         env_value = envs.VLLM_USE_TRTLLM_CONTEXT_ATTENTION
         if env_value is not None:
@@ -560,6 +564,7 @@ class FlashInferImpl(AttentionImpl):
         logits_soft_cap: Optional[float] = None,
         attn_type: AttentionType = AttentionType.DECODER,
         kv_sharing_target_layer_name: Optional[int] = None,
+        sinks: Optional[list[torch.Tensor]] = None,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -583,6 +588,13 @@ class FlashInferImpl(AttentionImpl):
                                       "encoder/decoder cross-attention "
                                       "are not implemented for "
                                       "FlashInferImpl")
+
+        self.sinks: Optional[torch.Tensor] = None
+        if sinks is not None:
+            assert sinks.shape[
+                0] == num_heads, "Sinks must have the same number of heads as the number of heads in the layer"
+            assert sinks.dtype == torch.float32, "Sinks must be of type float32"
+            self.sinks = sinks
 
     def forward(
         self,
@@ -689,6 +701,7 @@ class FlashInferImpl(AttentionImpl):
                     attn_metadata.num_prefills, attn_metadata.max_seq_len,
                     self.kv_cache_dtype, attn_metadata.num_qo_heads,
                     attn_metadata.num_kv_heads, attn_metadata.head_dim):
+                assert self.sinks is None
                 assert prefill_wrapper._window_left == window_left
                 assert prefill_wrapper._logits_soft_cap == (self.logits_soft_cap
                                                             or 0.0)
@@ -700,6 +713,7 @@ class FlashInferImpl(AttentionImpl):
                 # TODO: need to update flashinfer to expose logits_soft_cap and sm_scale for trtllm-gen backend
                 # logits_soft_cap=self.logits_soft_cap,
                 # sm_scale=self.scale,
+                sinks=self.sinks,
                 k_scale=layer._k_scale_float,
                 v_scale=layer._v_scale_float,
                 out=output[num_decode_tokens:],
@@ -712,6 +726,7 @@ class FlashInferImpl(AttentionImpl):
                     attn_metadata.num_decodes, attn_metadata.max_seq_len,
                     self.kv_cache_dtype, attn_metadata.num_qo_heads,
                     attn_metadata.num_kv_heads, attn_metadata.head_dim):
+                assert self.sinks is None
                 assert decode_wrapper._window_left == window_left
                 assert decode_wrapper._logits_soft_cap == (self.logits_soft_cap
                                                         or 0.0)
@@ -723,6 +738,7 @@ class FlashInferImpl(AttentionImpl):
                 # TODO: need to update flashinfer to expose logits_soft_cap
                 # logits_soft_cap=self.logits_soft_cap,
                 # sm_scale=self.scale,
+                sinks=self.sinks,
                 k_scale=layer._k_scale_float,
                 v_scale=layer._v_scale_float,
                 out=output[:num_decode_tokens],
