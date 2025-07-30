@@ -384,8 +384,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 prefill_start = num_decodes
                 attn_metadata.prefill_wrapper = self._get_prefill_wrapper(
                     backend="trtllm-gen" if use_trtllm_context_attention else 'auto')
-                assert attn_metadata.qo_indptr[prefill_start:].shape[
-                    0] == num_prefills + 1
                 assert attn_metadata.paged_kv_indptr_cpu[prefill_start:].shape[
                     0] == num_prefills + 1
                 assert attn_metadata.paged_kv_last_page_len_cpu[
@@ -423,9 +421,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         attn_metadata.head_dim)
                 attn_metadata.decode_wrapper = self._get_decode_wrapper(backend="trtllm-gen" if use_trtllm_decode_attention else 'auto')
                 attn_metadata.decode_wrapper.plan(
-                    attn_metadata.paged_kv_indptr[:num_decodes + 1],
+                    attn_metadata.paged_kv_indptr_cpu[:num_decodes + 1],
                     attn_metadata.paged_kv_indices,
-                    attn_metadata.paged_kv_last_page_len[:num_decodes],
+                    attn_metadata.paged_kv_last_page_len_cpu[:num_decodes],
                     attn_metadata.num_qo_heads,
                     attn_metadata.num_kv_heads,
                     attn_metadata.head_dim,
