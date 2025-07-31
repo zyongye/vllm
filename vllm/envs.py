@@ -993,9 +993,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_CUDAGRAPH_GC":
     lambda: bool(int(os.getenv("VLLM_ENABLE_CUDAGRAPH_GC", "0"))),
 
-    # If set to 1, use the FlashInfer MXFP4 MoE backend.
+    # If set to 1, use the FlashInfer MXFP4 x MXFP8 MoE backend.
     "VLLM_USE_FLASHINFER_MXFP4_MOE":
     lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_MXFP4_MOE", "0"))),
+
+    # If set to 1, use the FlashInfer MXFP4 x BF16 MoE backend.
+    "VLLM_USE_FLASHINFER_MXFP4_BF16_MOE":
+    lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_MXFP4_BF16_MOE", "0"))),
 
     # Used to force set up loopback IP
     "VLLM_LOOPBACK_IP":

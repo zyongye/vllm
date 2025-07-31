@@ -452,15 +452,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if enable_eplb:
             raise NotImplementedError("EPLB is not supported for mxfp4")
         
-        if envs.VLLM_USE_FLASHINFER_MXFP4_MOE:
+        if envs.VLLM_USE_FLASHINFER_MXFP4_MOE or envs.VLLM_USE_FLASHINFER_MXFP4_BF16_MOE:
             assert not self.moe.use_ep, "EP is not supported for flashinfer mxfp4 moe backend yet."
-            x_quant, x_scale = mxfp8_quantize(x, False) # to mxfp8
-            x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+            dtype_weights = DtypeFusedMoeTrtllmGen.MxE2m1
+            if envs.VLLM_USE_FLASHINFER_MXFP4_BF16_MOE:
+                assert x.dtype == torch.bfloat16
+                x_quant = x
+                x_scale = None
+                dtype_act = DtypeFusedMoeTrtllmGen.Bfloat16
+            else:
+                x_quant, x_scale = mxfp8_quantize(x, False) # to mxfp8
+                x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+                dtype_act = DtypeFusedMoeTrtllmGen.MxE4m3
             trtllm_gen_output = fused_moe_trtllmgen(
                 router_logits.to(torch.bfloat16),
                 None, # routing_bias
-                x_quant, # e4m3
-                x_scale, # ue8m0
+                x_quant,
+                x_scale,
                 layer.w13_weight, # uint8 (e2m1 x 2)
                 layer.w13_weight_scale, # uint8 (e4m3 x 2)
                 layer.w13_bias, # fp32 per expert per channel
@@ -485,8 +493,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self._get_tile_tokens_dim(x, top_k),
                 1, # routing_method_type, renormalize
                 True, # do finalize
-                DtypeFusedMoeTrtllmGen.MxE4m3, # dtype_act
-                DtypeFusedMoeTrtllmGen.MxE2m1, # dtype_weights
+                dtype_act,
+                dtype_weights,
             )[0]
             
             return trtllm_gen_output
