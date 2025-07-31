@@ -161,6 +161,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, 256)
             hidden_size = round_up(hidden_size, 256)
+        elif current_platform.is_rocm():
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size_per_partition, 128)
+        else:
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size_per_partition, 64)
 
         self.intermediate_size = intermediate_size_per_partition_after_pad
         self.hidden_size = hidden_size
