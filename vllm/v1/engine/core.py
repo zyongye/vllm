@@ -48,6 +48,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
+import vllm.envs as envs
 
 logger = init_logger(__name__)
 
@@ -129,15 +130,16 @@ class EngineCore:
         # cudaProfilerApi Support
         self._perf_iter = 0
         self._profiler_running = False
-        _perf_env_str = os.environ.get("VLLM_PROFILE_START_STOP", "None")
+        _perf_env_str = envs.VLLM_NSYS_PROFILE_START_STOP
         if '-' in _perf_env_str:
             start, stop = _perf_env_str.strip().split('-')
             self._start_perf_iter = int(start)
             self._stop_perf_iter = int(stop)
+            logger.info(f"NSYS Profiler START-STOP: {self._start_perf_iter}-{self._stop_perf_iter}")
         else:
             self._start_perf_iter = -1
             self._stop_perf_iter = -1
-        logger.info(f"Profiler START-STOP: {self._start_perf_iter}-{self._stop_perf_iter}")
+        
 
         # Setup batch queue for pipeline parallelism.
         # Batch queue for scheduled batches. This enables us to asynchronously
