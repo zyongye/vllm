@@ -128,8 +128,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
-        intermediate_size_per_partition_after_pad = round_up(
-            intermediate_size_per_partition, 64)
         if envs.VLLM_USE_FLASHINFER_MXFP4_MOE:
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, 256)
