@@ -23,14 +23,13 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils import round_up
 from vllm.platforms import current_platform
 
-# from flashinfer.fused_moe import cutlass_fused_moe
-from flashinfer import (block_scale_interleave,
-                        fused_moe_trtllmgen,
-                        DtypeFusedMoeTrtllmGen,
-                        mxfp8_quantize,
-                        reorder_rows_for_gated_act_gemm,
-                        shuffle_matrix_a,
-                        shuffle_matrix_sf_a)
+if envs.VLLM_USE_FLASHINFER_MXFP4_MOE or envs.VLLM_USE_FLASHINFER_MXFP4_BF16_MOE:
+    # from flashinfer.fused_moe import cutlass_fused_moe
+    from flashinfer import (trtllm_fp4_block_scale_moe,
+                            mxfp8_quantize,
+                            reorder_rows_for_gated_act_gemm,
+                            shuffle_matrix_a,
+                            shuffle_matrix_sf_a)
 
 class Mxfp4Config(QuantizationConfig):
 
@@ -432,17 +431,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         
         if envs.VLLM_USE_FLASHINFER_MXFP4_MOE or envs.VLLM_USE_FLASHINFER_MXFP4_BF16_MOE:
             assert not self.moe.use_ep, "EP is not supported for flashinfer mxfp4 moe backend yet."
-            dtype_weights = DtypeFusedMoeTrtllmGen.MxE2m1
             if envs.VLLM_USE_FLASHINFER_MXFP4_BF16_MOE:
                 assert x.dtype == torch.bfloat16
                 x_quant = x
                 x_scale = None
-                dtype_act = DtypeFusedMoeTrtllmGen.Bfloat16
             else:
                 x_quant, x_scale = mxfp8_quantize(x, False) # to mxfp8
                 x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
-                dtype_act = DtypeFusedMoeTrtllmGen.MxE4m3
-            trtllm_gen_output = fused_moe_trtllmgen(
+            trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
                 None, # routing_bias
                 x_quant,
@@ -464,17 +460,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 None, # n_group
                 None, # topk_group
                 self.intermediate_size, # padded to multiple of 256
-                self.hidden_size, # padded to multiple of 256
                 0, # local_expert_offset
                 self.num_experts, # local num experts
                 None,
                 self._get_tile_tokens_dim(x, top_k),
                 1, # routing_method_type, renormalize
                 True, # do finalize
-                dtype_act,
-                dtype_weights,
             )[0]
-            
             return trtllm_gen_output
 
         if self.moe.use_ep:
