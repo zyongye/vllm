@@ -145,6 +145,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
     VLLM_NSYS_PROFILE_START_STOP: str = "None"
+    VLLM_PRINT_LOGO: bool = True
 
 
 def get_default_cache_root():
@@ -1015,6 +1016,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The default value is "VLLM".
     "VLLM_PROCESS_NAME_PREFIX":
     lambda: os.getenv("VLLM_PROCESS_NAME_PREFIX", "VLLM"),
+
+    # If set, print logo
+    "VLLM_PRINT_LOGO":
+    lambda: bool(int(os.getenv("VLLM_PRINT_LOGO", "1"))),
 }
 
 # --8<-- [end:env-vars-definition]

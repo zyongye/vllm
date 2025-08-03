@@ -3298,3 +3298,32 @@ def bind_process_name(name: str, suffix: str = "") -> None:
     if suffix:
         name = f"{name}_{suffix}"
     setproctitle.setproctitle(name)
+
+def print_logo():
+    from colorama import Style, init
+
+    init()
+
+    def rgb(r, g, b):
+        return f"\033[38;2;{r};{g};{b}m"
+
+    reset = "\033[0m"
+
+    logo = """
+             LL          LL          MMM       MMM 
+             LL          LL          MMMM     MMMM
+         V   LL          LL          MM MM   MM MM
+vvvv  VVVV   LL          LL          MM  MM MM  MM
+vvvv VVVV    LL          LL          MM   MMM   MM
+ vvv VVVV    LL          LL          MM    M    MM
+  vvVVVV     LL          LL          MM         MM
+    VVVV     LLLLLLLLLL  LLLLLLLLL   M           M
+"""
+
+    colored_logo = (
+        logo.replace("v", rgb(255, 187, 29) + "v" + reset)
+            .replace("V", rgb(256, 169, 255) + "V" + reset)     
+    )
+
+    print(colored_logo + Style.RESET_ALL)
+
