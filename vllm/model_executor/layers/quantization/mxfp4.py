@@ -194,7 +194,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
-        if envs.VLLM_USE_FLASHINFER_MXFP4_MOE:
+        if envs.VLLM_USE_FLASHINFER_MXFP4_MOE or envs.VLLM_USE_FLASHINFER_MXFP4_BF16_MOE:
             layer.gemm1_alpha = Parameter(
                 torch.tensor(
                     [1.702] * self.num_experts,
