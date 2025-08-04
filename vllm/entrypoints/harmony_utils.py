@@ -7,7 +7,7 @@ from typing import Literal, Optional
 from openai.types.responses import (ResponseInputParam, ResponseOutputMessage,
                                     ResponseOutputText)
 from openai.types.responses.response_function_web_search import (
-    ActionFind, ActionSearch, ResponseFunctionWebSearch)
+    ActionFind, ActionOpenPage, ActionSearch, ResponseFunctionWebSearch)
 from openai_harmony import (Conversation, DeveloperContent,
                             HarmonyEncodingName, Message, ReasoningEffort,
                             Role, StreamableParser, SystemContent, TextContent,
@@ -15,7 +15,7 @@ from openai_harmony import (Conversation, DeveloperContent,
 
 from typing import Any
 
-from vllm.entrypoints.openai.protocol import ResponseReasoningItem
+from vllm.entrypoints.openai.protocol import ResponseReasoningItem, ResponseReasoningTextContent
 from vllm.utils import random_uuid
 
 REASONING_EFFORT = {
@@ -124,11 +124,13 @@ def parse_output_message(message: Message):
         if recipient == "browser.search":
             action = ActionSearch(query=browser_call["query"], type="search")
         elif recipient == "browser.open":
-            # action = ActionOpenPage(url=browser_call["url"], type="open_page")
-            # FIXME
-            return []
+            url = ""  # FIXME: browser_call["url"]
+            action = ActionOpenPage(url=url, type="open_page")
         elif recipient == "browser.find":
-            action = ActionFind(pattern=browser_call["pattern"], type="find")
+            url = ""  # FIXME: browser_call["url"]
+            action = ActionFind(pattern=browser_call["pattern"],
+                                url=url,
+                                type="find")
         else:
             raise ValueError(f"Unknown browser action: {recipient}")
         web_search_item = ResponseFunctionWebSearch(
@@ -141,7 +143,7 @@ def parse_output_message(message: Message):
     elif message.channel in ("analysis", "commentary"):
         for content in message.content:
             reasoning_item = ResponseReasoningItem(
-                text=content.text,
+                content=[ResponseReasoningTextContent(text=content.text)],
                 status=None,
             )
             output_items.append(reasoning_item)

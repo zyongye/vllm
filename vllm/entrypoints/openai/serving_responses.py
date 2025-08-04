@@ -10,6 +10,7 @@ from typing import Callable, Final, Optional, Union
 import jinja2
 from fastapi import Request
 from openai.types.responses import ResponseOutputMessage, ResponseOutputText
+import openai.types.responses as openai_responses_tyes
 from openai_harmony import Message as OpenAIMessage
 
 from vllm.config import ModelConfig
@@ -29,6 +30,7 @@ from vllm.entrypoints.openai.protocol import (ErrorResponse,
                                               PromptTokenUsageInfo,
                                               RequestResponseMetadata,
                                               ResponseReasoningItem,
+                                              ResponseReasoningTextContent,
                                               ResponsesRequest,
                                               ResponsesResponse, UsageInfo)
 # yapf: enable
@@ -102,6 +104,8 @@ class OpenAIServingResponses(OpenAIServing):
         self.supports_code_interpreter = False
         self.use_harmony = True  # FIXME
         if self.use_harmony:
+            logger.warning("For gpt-oss, we ignore --enable-auto-tool-choice "
+                           "and always enable tool use.")
             # OpenAI models have two EOS-like tokens: <|return|> and <|call|>.
             # We need to add them to the stop token ids.
             if "stop_token_ids" not in self.default_sampling_params:
@@ -392,7 +396,7 @@ class OpenAIServingResponses(OpenAIServing):
         output_items = []
         if reasoning_content:
             reasoning_item = ResponseReasoningItem(
-                text=reasoning_content,
+                content=[ResponseReasoningTextContent(text=reasoning_content)],
                 status=None,  # NOTE: Only the last output item has status.
             )
             output_items.append(reasoning_item)
