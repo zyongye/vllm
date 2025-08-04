@@ -74,29 +74,6 @@ class Mxfp4Config(QuantizationConfig):
                 "Mxfp4 attention layer is not implemented")
         return None
 
-
-from torch.nn import functional as F
-def compute_routing(
-    router_logits: torch.Tensor, top_k: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute routing weights and selected experts from router logits.
-
-    Args:
-        router_logits (torch.Tensor): Router logits of shape [batch_size, num_experts]
-        top_k (int): Number of experts to route to per token
-
-    Returns:
-        tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-            - routing_weights: Expert weights of shape [batch_size, top_k]
-            - selected_experts: Expert indices of shape [batch_size, top_k]
-    """
-    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-    routing_weights = routing_weights.float()
-    return routing_weights, selected_experts
-
 def next_positive_power_of_2(x: int) -> int:
     if x < 1:
         return 1
@@ -127,7 +104,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
-        if envs.VLLM_USE_FLASHINFER_MXFP4_MOE:
+        if envs.VLLM_USE_FLASHINFER_MXFP4_MOE or envs.VLLM_USE_FLASHINFER_MXFP4_BF16_MOE:
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, 256)
             hidden_size = round_up(hidden_size, 256)
