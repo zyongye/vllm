@@ -198,6 +198,7 @@ def use_trtllm_context_attention(
             and has_nvidia_artifactory()):
         return False
 
+    # TODO: update the check to compatible with latest trtllm-gen kernel
     # Check if the dimensions are supported by TRTLLM decode attention
     if (attn_head_size is None or num_qo_heads is None or num_kv_heads is None
             or num_qo_heads // num_kv_heads > 8
@@ -216,6 +217,9 @@ def use_trtllm_context_attention(
         if not no_use_trtllm:
             logger.info_once("Using TRTLLM context attention.")
         return not no_use_trtllm
+
+    # TODO: add heuristic
+    return False
 
 __all__ = [
     "has_flashinfer",

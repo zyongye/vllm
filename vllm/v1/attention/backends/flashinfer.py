@@ -344,7 +344,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             if num_prefills > 0:
                 # Decodes are first so prefills start after the last decode
                 prefill_start = num_decodes
-                use_trtllm_context_attention = use_trtllm_context_attention(
+                use_trtllm_context_attention_ = use_trtllm_context_attention(
                     num_prefills, attn_metadata.max_seq_len,
                     self.cache_config.cache_dtype,
                     attn_metadata.num_qo_heads, attn_metadata.num_kv_heads,
