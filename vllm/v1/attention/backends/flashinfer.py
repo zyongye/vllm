@@ -729,6 +729,7 @@ class FlashInferImpl(AttentionImpl):
             prefill_wrapper.run(
                 prefill_query,
                 kv_cache_permute,
+                window_left=window_left,
                 sinks=self.sinks,
                 k_scale=layer._k_scale_float,
                 v_scale=layer._v_scale_float,
@@ -749,6 +750,7 @@ class FlashInferImpl(AttentionImpl):
                 decode_wrapper.run(
                     decode_query,
                     kv_cache_permute,
+                    window_left=window_left,
                     k_scale=layer._k_scale_float,
                     v_scale=layer._v_scale_float,
                     out=output[:num_decode_tokens],
@@ -780,6 +782,7 @@ class FlashInferImpl(AttentionImpl):
                         max_seq_len=attn_metadata.max_seq_len,
                         bmm1_scale=layer._k_scale_float * self.scale,
                         bmm2_scale=layer._v_scale_float,
+                        window_left=window_left,
                         sinks=self.sinks,
                         out=output[:num_decode_tokens],
                     )
