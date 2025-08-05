@@ -724,11 +724,12 @@ class FusedMoE(torch.nn.Module):
             if has_triton_kernels:
                 self.use_triton_kernels = True
                 if (current_platform.is_rocm()
-                    or self.moe_parallel_config.use_deepep_ll_kernels
-                    or envs.VLLM_USE_FLASHINFER_MXFP4_MOE
-                    or envs.VLLM_USE_FLASHINFER_MXFP4_BF16_MOE
-                    or self.moe_parallel_config.use_deepep_ll_kernels):
-                    # For ROCm or DEEPEP low latency, we need to round up the hidden size
+                        or self.moe_parallel_config.use_deepep_ll_kernels
+                        or envs.VLLM_USE_FLASHINFER_MXFP4_MOE
+                        or envs.VLLM_USE_FLASHINFER_MXFP4_BF16_MOE
+                        or self.moe_parallel_config.use_deepep_ll_kernels):
+                    # For ROCm or DEEPEP low latency,
+                    # we need to round up the hidden size
                     hidden_size = round_up(hidden_size, 256)
             else:
                 raise ValueError("triton_kernels must be installed first")

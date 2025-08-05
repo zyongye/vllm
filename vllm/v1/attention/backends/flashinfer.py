@@ -19,7 +19,8 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils import cdiv, is_pin_memory_available
-from vllm.utils.flashinfer import use_trtllm_decode_attention, use_trtllm_context_attention
+from vllm.utils.flashinfer import (use_trtllm_context_attention,
+                                   use_trtllm_decode_attention)
 from vllm.v1.attention.backends.flash_attn import use_cascade_attention
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -252,7 +253,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     def _get_prefill_wrapper(self, backend = 'auto'):
         if self._prefill_wrapper is None:
             self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                self._get_workspace_buffer(), get_kv_cache_layout(), backend=backend)
+                self._get_workspace_buffer(),
+                get_kv_cache_layout(),
+                backend=backend)
         return self._prefill_wrapper
 
     def _get_decode_wrapper(self,
@@ -349,8 +352,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     self.cache_config.cache_dtype,
                     attn_metadata.num_qo_heads, attn_metadata.num_kv_heads,
                     attn_metadata.head_dim)
-                attn_metadata.prefill_wrapper = self._get_prefill_wrapper(
-                    backend="trtllm-gen" if use_trtllm_context_attention else 'auto')
+                backend = ("trtllm-gen" if use_trtllm_context_attention_
+                           else 'auto')
+                attn_metadata.prefill_wrapper = \
+                    self._get_prefill_wrapper(backend=backend)
                 assert attn_metadata.qo_indptr_cpu[prefill_start:].shape[
                     0] == num_prefills + 1
                 assert attn_metadata.paged_kv_indptr_cpu[prefill_start:].shape[
@@ -612,8 +617,10 @@ class FlashInferImpl(AttentionImpl):
                                       "FlashInferImpl")
         self.sinks: Optional[torch.Tensor] = None
         if sinks is not None:
-            assert sinks.shape[
-                0] == num_heads, "Sinks must have the same number of heads as the number of heads in the layer"
+            assert sinks.shape[0] == num_heads, (
+                "Sinks must have the same number of heads "
+                "as the number of heads in the layer"
+            )
             assert sinks.dtype == torch.float32, "Sinks must be of type float32"
             self.sinks = sinks
 

@@ -221,6 +221,7 @@ def use_trtllm_context_attention(
     # TODO: add heuristic
     return False
 
+
 __all__ = [
     "has_flashinfer",
     "flashinfer_trtllm_fp8_block_scale_moe",

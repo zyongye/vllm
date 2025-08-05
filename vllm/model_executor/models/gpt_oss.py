@@ -70,10 +70,13 @@ class OAIAttention(nn.Module):
 
         tp_size = get_tensor_model_parallel_world_size()
 
-        attention_sink_dtype = torch.float32 if envs.VLLM_USE_TRTLLM_CONTEXT_ATTENTION or envs.VLLM_USE_TRTLLM_DECODE_ATTENTION else torch.bfloat16
+        attention_sink_dtype = (
+            torch.float32 if envs.VLLM_USE_TRTLLM_CONTEXT_ATTENTION
+            or envs.VLLM_USE_TRTLLM_DECODE_ATTENTION else torch.bfloat16)
         self.sinks = torch.nn.Parameter(
             torch.empty(config.num_attention_heads // tp_size,
-                        dtype=attention_sink_dtype, requires_grad=False))
+                        dtype=attention_sink_dtype,
+                        requires_grad=False))
 
         self.norm = RMSNorm(config.hidden_size, eps=1e-5)
 

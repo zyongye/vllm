@@ -14,8 +14,8 @@ from logging import DEBUG
 from typing import Any, Callable, Optional, TypeVar, Union
 
 import msgspec
-import zmq
 import torch.cuda.profiler as profiler
+import zmq
 
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
@@ -47,7 +47,6 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
-import vllm.envs as envs
 
 logger = init_logger(__name__)
 
@@ -134,7 +133,6 @@ class EngineCore:
         self.mm_input_cache_server = MirroredProcessingCache(
             vllm_config.model_config)
 
-
         # cudaProfilerApi Support
         self._perf_iter = 0
         self._profiler_running = False
@@ -143,11 +141,9 @@ class EngineCore:
             start, stop = _perf_env_str.strip().split('-')
             self._start_perf_iter = int(start)
             self._stop_perf_iter = int(stop)
-            logger.info(f"NSYS Profiler START-STOP: {self._start_perf_iter}-{self._stop_perf_iter}")
         else:
             self._start_perf_iter = -1
             self._stop_perf_iter = -1
-        
 
         # Setup batch queue for pipeline parallelism.
         # Batch queue for scheduled batches. This enables us to asynchronously
@@ -288,12 +284,12 @@ class EngineCore:
 
         # Profiler Start and Stop
         if self._perf_iter == self._start_perf_iter:
-            logger.info(f"Starting profiler at {self._perf_iter}")
+            logger.info("Starting profiler")
             profiler.start()
             self._profiler_running = True
 
         if self._perf_iter == self._stop_perf_iter:
-            logger.info(f"Stopping profiler at {self._perf_iter}")
+            logger.info("Stopping profiler")
             profiler.stop()
             self._profiler_running = False
         self._perf_iter += 1
@@ -367,7 +363,7 @@ class EngineCore:
 
         # Check if profiler is running
         if self._profiler_running:
-            logger.info(f"Stopping profiler at {self._perf_iter}")
+            logger.info("Stopping profiler")
             profiler.stop()
 
         self.structured_output_manager.clear_backend()

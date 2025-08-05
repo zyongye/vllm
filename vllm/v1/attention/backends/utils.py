@@ -254,7 +254,8 @@ def get_kv_cache_layout():
     # Override with format specified by the user.
     cache_layout = envs.VLLM_KV_CACHE_LAYOUT
     if cache_layout is None:
-        if envs.VLLM_USE_TRTLLM_CONTEXT_ATTENTION or envs.VLLM_USE_TRTLLM_DECODE_ATTENTION:
+        if (envs.VLLM_USE_TRTLLM_CONTEXT_ATTENTION
+                or envs.VLLM_USE_TRTLLM_DECODE_ATTENTION):
             cache_layout = "HND"
         else:
             cache_layout = get_kv_connector_cache_layout()
@@ -315,7 +316,8 @@ def get_per_layer_parameters(
 def infer_global_hyperparameters(
         per_layer_params: dict[str, PerLayerParameters]) -> PerLayerParameters:
     """
-    Currently, FlashInfer backend other than trtllm-gen only support models in which all layers share
+    Currently, FlashInfer backend other than trtllm-gen 
+    only support models in which all layers share
     the same values for the following hyperparameters:
     - `window_left`
     - `logits_soft_cap`
@@ -331,15 +333,17 @@ def infer_global_hyperparameters(
     global_params = param_sets[0]
 
     # trtllm attention doesn't need global hyper params so disable the check
-    if not envs.VLLM_USE_TRTLLM_CONTEXT_ATTENTION and not envs.VLLM_USE_TRTLLM_DECODE_ATTENTION:
+    if (not envs.VLLM_USE_TRTLLM_CONTEXT_ATTENTION
+            and not envs.VLLM_USE_TRTLLM_DECODE_ATTENTION):
         for params in param_sets:
             if params.window_left != global_params.window_left:
                 raise ValueError(
-                    "Window left is not the same for all layers. One potential fix "
-                    "is to set disable_sliding_window=True")
+                    "Window left is not the same for all layers. " \
+                    "One potential fix is to set disable_sliding_window=True")
             assert params == global_params, (
-                "FlashInfer backend currently only supports models in which all "
-                "layers share the same values for the following hyperparameters: "
+                "FlashInfer backend currently only supports models in which all"
+                "layers share the same values "
+                "for the following hyperparameters:"
                 "`window_left`, `logits_soft_cap`, `sm_scale`.")
 
     return global_params
