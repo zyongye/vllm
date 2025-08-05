@@ -22,10 +22,16 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import next_power_of_2, round_up
 
+from vllm.model_executor.layers.fused_moe.modular_kernel import (
+    FusedMoEActivationFormat, FusedMoEModularKernel,
+    FusedMoEPermuteExpertsUnpermute, FusedMoEPrepareAndFinalize)
+from vllm.model_executor.layers.fused_moe.prepare_finalize import MoEPrepareAndFinalizeNoEP
+from vllm.model_executor.layers.fused_moe.trtllm_moe import TrtLlmGenExperts
+
 if (envs.VLLM_USE_FLASHINFER_MXFP4_MOE
         or envs.VLLM_USE_FLASHINFER_MXFP4_BF16_MOE):
     # from flashinfer.fused_moe import cutlass_fused_moe
-    from flashinfer import (mxfp8_quantize, shuffle_matrix_a,
+    from flashinfer import (mxfp8_quantize, shuffle_matrix_a,trtllm_fp4_block_scale_routed_moe,
                             shuffle_matrix_sf_a, trtllm_fp4_block_scale_moe)
 
 
@@ -347,8 +353,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_precision=self.w2_precision_config,
             )
         else:
-            raise NotImplementedError(
-                "Mxfp4 does not support non-batched experts format for EP")
+            if (envs.VLLM_USE_FLASHINFER_MXFP4_MOE
+                or envs.VLLM_USE_FLASHINFER_MXFP4_BF16_MOE):
+                return TrtLlmGenExperts(None)
+            else:
+                raise NotImplementedError(
+                    "Mxfp4 does not support non-batched experts format for EP")
 
     def _get_tile_tokens_dim(self, x: torch.Tensor, top_k: int):
         # Number of tokens in the input tensor.
@@ -405,6 +415,97 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if (envs.VLLM_USE_FLASHINFER_MXFP4_MOE
                 or envs.VLLM_USE_FLASHINFER_MXFP4_BF16_MOE):
+            
+            # assert not self.moe.use_ep, "EP is not supported for flashinfer mxfp4 moe backend yet."
+            routing_weights, selected_experts = torch.topk(router_logits, top_k, dim=-1)
+            routing_weights = torch.nn.functional.softmax(routing_weights, dim=-1, dtype=torch.float)
+            routing_weights_bf16 = routing_weights.to(torch.bfloat16)
+
+            extra_expert_args = {
+                'gemm1_alpha': layer.gemm1_alpha, # fp32 per expert
+                'gemm1_beta': layer.gemm1_beta, # fp32 per expert
+                'gemm1_clamp_limit': layer.gemm1_clamp_limit, # fp32 per expert
+            }
+
+            # extra_finalize_args = {
+            #     # 'use_dp': layer.dp_size > 1,
+            #     # 'local_tokens': x.shape[0],
+            #     "skip_weight_reduce": True,  
+            # }
+
+            # extra_prepare_args = {
+            #     'use_dp': layer.dp_size > 1,
+            #     'local_tokens': x.shape[0],
+            # }
+            # prepare_finalize = MoEPrepareAndFinalizeNoEP()
+            # experts = TrtLlmGenExperts(None)
+            # self.fused_experts = FusedMoEModularKernel(
+            #     prepare_finalize,
+            #     experts,
+            # )
+            return self.fused_experts(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=routing_weights_bf16,
+                topk_ids=selected_experts,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                w1_bias=layer.w13_bias,
+                w2_bias=layer.w2_bias,
+                # extra_prepare_args=extra_prepare_args,
+                # extra_finalize_args=extra_finalize_args,
+                extra_expert_args=extra_expert_args,
+            )
+            # if envs.VLLM_USE_FLASHINFER_MXFP4_BF16_MOE:
+            #     assert x.dtype == torch.bfloat16
+            #     x_quant = x
+            #     x_scale = None
+            # else:
+            #     x_quant, x_scale = mxfp8_quantize(x, False)  # to mxfp8
+            #     x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+
+            # packed_tensor = (selected_experts.to(torch.int32) << 16) | routing_weights_bf16.view(torch.int16).to(torch.int32)
+            
+            # trtllm_gen_output = trtllm_fp4_block_scale_routed_moe(
+            #     packed_tensor,
+            #     # routing_weights_bf16,
+            #     None, # routing_bias
+            #     x_quant,
+            #     x_scale,
+            #     layer.w13_weight, # uint8 (e2m1 x 2)
+            #     layer.w13_weight_scale, # uint8 (e4m3 x 2)
+            #     layer.w13_bias, # fp32 per expert per channel
+            #     layer.gemm1_alpha, # fp32 per expert
+            #     layer.gemm1_beta, # fp32 per expert
+            #     layer.gemm1_clamp_limit, # fp32 per expert
+            #     layer.w2_weight, # uint8 (e2m1 x 2)
+            #     layer.w2_weight_scale, # ue8m0
+            #     layer.w2_bias, # fp32 per expert per channel
+            #     None, # output1_scale_scalar
+            #     None, # output1_scale_gate_scalar
+            #     None, # output2_scale_scalar
+            #     self.num_experts,
+            #     top_k,
+            #     None, # n_group
+            #     None, # topk_group
+            #     self.intermediate_size, # padded to multiple of 256
+            #     0, # local_expert_offset
+            #     self.num_experts, # local num experts
+            #     None,
+            #     self._get_tile_tokens_dim(x, top_k),
+            #     1, # routing_method_type, renormalize
+            #     True, # do finalize
+            #     None,
+            # )[0]
+            # return trtllm_gen_output
+
+
+            
+        
+
             assert not self.moe.use_ep, (
                 "EP is not supported for flashinfer mxfp4 moe backend yet.")
             if envs.VLLM_USE_FLASHINFER_MXFP4_BF16_MOE:

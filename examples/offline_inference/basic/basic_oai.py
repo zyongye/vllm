@@ -17,9 +17,9 @@ prompts = [
 sampling_params = SamplingParams(temperature=0, max_tokens=100)
 
 MODEL_PATH = os.environ.get(
-    "MODEL_PATH", "/data/xmo/os-mini/models/gpt-oss-20b-hf"
+    "MODEL_PATH", "/data/xmo/yongye/models/gpt-oss-20b-hf"
 )
-TP=os.environ.get("VLLM_TENSOR_PARALLEL_SIZE", "4")
+TP=os.environ.get("VLLM_TENSOR_PARALLEL_SIZE", "1")
 
 def main():
     

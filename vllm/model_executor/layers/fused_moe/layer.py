@@ -104,6 +104,10 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 
         prepare_finalize: Optional[FusedMoEPrepareAndFinalize] = None
 
+        from vllm.model_executor.layers.fused_moe.naive_prepare_finalize import NaivePrepareAndFinalize
+
+        # return NaivePrepareAndFinalize()
+
         if moe.use_flashinfer_cutlass_kernels:
             prepare_finalize = FlashInferCutlassMoEPrepareAndFinalize(
                 quant_dtype=moe.quant_dtype, )
