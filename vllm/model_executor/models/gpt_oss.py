@@ -189,17 +189,19 @@ class TransformerBlock(torch.nn.Module):
         output = self.mlp(attn_output)
         return output
 
+
 @support_torch_compile
 class GptOssModel(nn.Module):
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+    ):
         super().__init__()
-
-        config = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
-
-        self.config = config
-        self.quant_config = quant_config
+        self.config = vllm_config.model_config.hf_config
+        self.quant_config = vllm_config.quant_config
         self.config.hidden_size = self.config.hidden_size
         self.embedding = VocabParallelEmbedding(
             self.config.vocab_size,
@@ -233,7 +235,6 @@ class GptOssForCausalLM(nn.Module):
         super().__init__()
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config.hf_config
-        self.quant_config = vllm_config.quant_config
         self.model = GptOssModel(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
@@ -445,7 +446,8 @@ class GptOssForCausalLM(nn.Module):
                 param.data.copy_(narrow_weight)
                 loaded_params.add(name)
             elif "q_proj" in name or "k_proj" in name or "v_proj" in name:
-                shard_id = "q" if "q_proj" in name else "k" if "k_proj" in name else "v"
+                shard_id = ("q" if "q_proj" in name else
+                            "k" if "k_proj" in name else "v")
                 name = name.replace("self_attn", "attn")
                 param_name = name.replace(f"{shard_id}_proj", "qkv")
                 param = params_dict[param_name]
