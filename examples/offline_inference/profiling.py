@@ -9,6 +9,7 @@ from argparse import RawTextHelpFormatter
 from collections.abc import Generator
 from dataclasses import asdict, dataclass
 from typing import Any, Optional, TypeAlias
+from datetime import datetime
 
 import torch
 import tqdm
@@ -21,6 +22,8 @@ from vllm.utils import FlexibleArgumentParser
 BATCH_SIZE_DEFAULT = 1
 PROMPT_LEN_DEFAULT = 256
 
+os.environ["VLLM_TORCH_PROFILER_DIR"] = "./vllm_profile"
+profile = False
 
 @dataclass
 class ProfileContext:
@@ -264,7 +267,7 @@ def run_profile(
 
     def abort_requests():
         for i in range(batch_size):
-            llm.llm_engine.abort_request(f"seq{i}")
+            llm.llm_engine.abort_request([f"seq{i}"])
 
     # Warm up run
     print("Warm up run ...")
@@ -276,117 +279,20 @@ def run_profile(
     print("Profile run ...")
     add_requests()
 
-    with layerwise_profile() as prefill_prof:
-        llm.llm_engine.step()  # First step is prefill
+    if profile:
+        llm.start_profile()
+    llm.llm_engine.step()  # First step is prefill
+    if profile:
+        llm.stop_profile()
 
     decode_profs = []
-    for _ in tqdm.tqdm(range(num_steps_to_profile - 1)):
-        num_running_seqs = llm.llm_engine.scheduler[0].get_num_unfinished_seq_groups()
-        with layerwise_profile(num_running_seqs=num_running_seqs) as decode_prof:
-            llm.llm_engine.step()
-        decode_profs.append(decode_prof)
-
-    decode_results_list = [prof.results for prof in decode_profs]
-    prefill_results = prefill_prof.results
-    has_decode = len(decode_results_list) > 0
-
-    LINE_WIDTH = 80
-    print("=" * LINE_WIDTH)
-    print(f"= Prefill Model Table (prompt_len={prompt_len}, batch_size={batch_size})")
-    print("=" * LINE_WIDTH)
-    print()
-    prefill_results.print_model_table()
-
-    if has_decode:
-        print()
-        print("=" * LINE_WIDTH)
-        print(
-            f"= First Decode Step Model Table "
-            f"(prompt_len={prompt_len}, batch_size={batch_size})"
-        )
-        print("=" * LINE_WIDTH)
-        print()
-        decode_results_list[0].print_model_table()
-
-    print()
-    print("=" * LINE_WIDTH)
-    print(f"= Prefill Summary Table (prompt_len={prompt_len}, batch_size={batch_size})")
-    print("=" * LINE_WIDTH)
-    print()
-    prefill_results.print_summary_table()
-
-    if has_decode:
-        print()
-        print("=" * LINE_WIDTH)
-        print(
-            f"= First Decode Step Summary Table "
-            f"(prompt_len={prompt_len}, batch_size={batch_size})"
-        )
-        print("=" * LINE_WIDTH)
-        print()
-        decode_results_list[0].print_summary_table()
-
-    if csv_output:
-        csv_filename_base = (
-            csv_output[:-4] if csv_output.endswith(".csv") else csv_output
-        )
-        prefill_results.export_model_stats_table_csv(
-            csv_filename_base + "_prefill_model_table.csv"
-        )
-        prefill_results.export_summary_stats_table_csv(
-            csv_filename_base + "_prefill_summary_table.csv"
-        )
-
-        if has_decode:
-            decode_results_list[0].export_model_stats_table_csv(
-                csv_filename_base + "_decode_model_table.csv"
-            )
-            decode_results_list[0].export_summary_stats_table_csv(
-                csv_filename_base + "_decode_summary_table.csv"
-            )
-
-    if json_output:
-        cuda_devices = [
-            torch.cuda.get_device_properties(dev_idx)
-            for dev_idx in range(torch.cuda.device_count())
-        ]
-
-        json_dict = {
-            "context": {
-                "python_version": f"{sys.version}",
-                "torch_version": f"{torch.__version__}",
-                "torch_cuda_version": f"{torch.version.cuda}",
-                "cuda_devices": f"{cuda_devices}",
-                **asdict(context),
-            },
-            "prefill": prefill_results.convert_stats_to_dict(),
-        }
-
-        if has_decode:
-            for idx, dr in enumerate(decode_results_list):
-                json_dict[f"decode_{idx + 1}"] = dr.convert_stats_to_dict()
-
-        # Add .json to json_output filename if it doesn't exist already.
-        json_output_file = (
-            json_output if json_output.endswith(".json") else json_output + ".json"
-        )
-        with open(json_output_file, "w+") as f:
-            json.dump(json_dict, f, indent=2)
-        pass
-
-    if context.save_chrome_traces_folder is not None:
-        os.makedirs(context.save_chrome_traces_folder, exist_ok=True)
-        prefill_prof.profiler.export_chrome_trace(
-            context.save_chrome_traces_folder + "/prefill.json"
-        )
-        for idx, decode_prof in enumerate(decode_profs):
-            decode_prof.profiler.export_chrome_trace(
-                context.save_chrome_traces_folder + f"/decode_{idx + 1}.json"
-            )
-        print(
-            "Traces saved as prefill.json and decode_1.json, etc."
-            f" in folder {context.save_chrome_traces_folder}"
-        )
+    for i in tqdm.tqdm(range(num_steps_to_profile - 1)):
+        start = datetime.now()
+        llm.llm_engine.step()
+        duration = datetime.now() - start
+        decode_profs.append(duration)
+        if i % 16 == 0:
+            print(duration)
 
 
 def parse_args():
