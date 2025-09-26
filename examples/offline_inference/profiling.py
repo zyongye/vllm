@@ -9,7 +9,7 @@ from argparse import RawTextHelpFormatter
 from collections.abc import Generator
 from dataclasses import asdict, dataclass
 from typing import Any, Optional, TypeAlias
-from datetime import datetime
+import time
 
 import torch
 import tqdm
@@ -23,6 +23,7 @@ BATCH_SIZE_DEFAULT = 1
 PROMPT_LEN_DEFAULT = 256
 
 os.environ["VLLM_TORCH_PROFILER_DIR"] = "./vllm_profile"
+os.environ["PRINT_TOKENS"] = "0"
 profile = False
 
 @dataclass
@@ -275,24 +276,30 @@ def run_profile(
     llm.llm_engine.step()  # Prefill
     llm.llm_engine.step()  # Decode
     abort_requests()
+    start = time.perf_counter()
+    end = time.perf_counter()
 
     print("Profile run ...")
     add_requests()
 
-    if profile:
-        llm.start_profile()
-    llm.llm_engine.step()  # First step is prefill
-    if profile:
-        llm.stop_profile()
-
     decode_profs = []
+    start = time.perf_counter()
+    llm.llm_engine.step()  # First step is prefill
+    duration = time.perf_counter() - start
+    decode_profs.append(duration)
+     
     for i in tqdm.tqdm(range(num_steps_to_profile - 1)):
-        start = datetime.now()
+        start = time.perf_counter()
+        # if i == num_steps_to_profile - 2:
+            # llm.start_profile()
         llm.llm_engine.step()
-        duration = datetime.now() - start
-        decode_profs.append(duration)
-        if i % 16 == 0:
-            print(duration)
+        # if i == num_steps_to_profile - 2:
+            # llm.stop_profile()
+        duration = time.perf_counter() - start
+        if (i - 14) % 16 == 0:
+            # print(duration)
+            decode_profs.append(duration)
+    print(decode_profs)
 
 
 def parse_args():
