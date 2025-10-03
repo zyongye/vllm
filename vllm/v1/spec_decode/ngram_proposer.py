@@ -157,7 +157,9 @@ class NgramProposer:
             num_tokens_no_spec,
             token_ids_cpu,
         )
-
+        B = len(req_ids)
+        if B > 0:
+            draft_token_ids = token_ids_cpu[:B, :5].tolist()
         return draft_token_ids
 
     def load_model(self, *args, **kwargs):
