@@ -626,19 +626,26 @@ def sparse_attn_indexer(
                 dtype=torch.float8_e4m3fn,
             )
             k_scale = torch.empty(
-                [chunk.total_seq_lens, 1], device=k.device, dtype=torch.float32
+                [chunk.total_seq_lens, 4], device=k.device, dtype=torch.uint8
             )
-            cp_gather_indexer_k_quant_cache(
+            ops.cp_gather_indexer_k_quant_cache(
                 kv_cache,
                 k_fp8,
                 k_scale,
                 chunk.block_table,
                 chunk.cu_seq_lens,
-                chunk.num_reqs,
             )
+            # cp_gather_indexer_k_quant_cache(
+            #     kv_cache,
+            #     k_fp8,
+            #     k_scale,
+            #     chunk.block_table,
+            #     chunk.cu_seq_lens,
+            #     chunk.num_reqs,
+            # )
             logits = fp8_mqa_logits(
                 q_fp8[chunk.token_start : chunk.token_end],
-                (k_fp8, k_scale),
+                (k_fp8, k_scale.view(torch.float32)),
                 weights[chunk.token_start : chunk.token_end],
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
