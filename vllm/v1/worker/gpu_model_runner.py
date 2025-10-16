@@ -2469,9 +2469,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         def propose_draft_token_ids(sampled_token_ids):
+            vocab_size = logits.shape[1]
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("Draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
+                    vocab_size,
                     scheduler_output,
                     sampled_token_ids,
                     self.input_batch.sampling_metadata,
@@ -2559,6 +2561,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def propose_draft_token_ids(
         self,
+        vocab_size: int,
         scheduler_output: "SchedulerOutput",
         sampled_token_ids: Union[torch.Tensor, list[list[int]]],
         sampling_metadata: SamplingMetadata,
@@ -2573,6 +2576,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, NgramProposer)
             draft_token_ids = self.drafter.propose(
+                vocab_size,
                 sampled_token_ids, self.input_batch.req_ids,
                 self.input_batch.num_tokens_no_spec,
                 self.input_batch.token_ids_cpu,

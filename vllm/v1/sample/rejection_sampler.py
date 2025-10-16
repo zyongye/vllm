@@ -102,6 +102,22 @@ class RejectionSampler(nn.Module):
             bonus_token_ids,
             sampling_metadata,
         )
+        num_req = len(metadata.num_draft_tokens)
+        # max_spec_token = max(metadata.num_draft_tokens)
+        # # draft_token_ids = metadata.draft_token_ids.reshape(num_req, -1)
+        # output_token_ids = torch.full((num_req, max_spec_token), -1, device=metadata.draft_token_ids.device)
+
+        for i in range(num_req):
+            num_drafe_token_per_req = metadata.num_draft_tokens[i]
+            token_start = metadata.cu_num_draft_tokens[i]
+            if num_drafe_token_per_req == 0:
+                continue
+            output_token_ids[i, 1:num_drafe_token_per_req] = metadata.draft_token_ids[token_start - num_drafe_token_per_req + 1: token_start]
+
+        print(f"spec_metadata: {metadata}")
+        print(f"draft_token_ids:{metadata.draft_token_ids.shape}")
+        print(f"out_token_ids:{output_token_ids}")
+        
         return output_token_ids
 
     @staticmethod

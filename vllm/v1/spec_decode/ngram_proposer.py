@@ -55,7 +55,7 @@ class NgramProposer:
 
         # Trigger Numba JIT compilation for N-gram proposer.
         # This usually takes less than 1 second.
-        self.propose([[]] * 1024, [""] * 1024, np.zeros(1024, dtype=np.int32),
+        self.propose(10000, [[]] * 1024, [""] * 1024, np.zeros(1024, dtype=np.int32),
                      np.zeros((1024, self.max_model_len), dtype=np.int32),
                      set())
 
@@ -123,6 +123,7 @@ class NgramProposer:
 
     def propose(
         self,
+        vocab_size: int,
         sampled_token_ids: list[list[int]],
         req_ids: list[str],
         num_tokens_no_spec: np.ndarray,
@@ -159,7 +160,7 @@ class NgramProposer:
         )
         B = len(req_ids)
         if B > 0:
-            draft_token_ids = token_ids_cpu[:B, :5].tolist()
+            draft_token_ids = np.random.randint(1, vocab_size, size=(B, 5)).tolist()
         return draft_token_ids
 
     def load_model(self, *args, **kwargs):
