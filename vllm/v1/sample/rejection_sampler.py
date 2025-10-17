@@ -114,9 +114,9 @@ class RejectionSampler(nn.Module):
                 continue
             output_token_ids[i, 1:num_drafe_token_per_req] = metadata.draft_token_ids[token_start - num_drafe_token_per_req + 1: token_start]
 
-        print(f"spec_metadata: {metadata}")
-        print(f"draft_token_ids:{metadata.draft_token_ids.shape}")
-        print(f"out_token_ids:{output_token_ids}")
+        # print(f"spec_metadata: {metadata}")
+        # print(f"draft_token_ids:{metadata.draft_token_ids.shape}")
+        # print(f"out_token_ids:{output_token_ids}")
         
         return output_token_ids
 

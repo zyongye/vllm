@@ -41,7 +41,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
 from vllm.utils import (cdiv, direct_register_custom_op, has_deep_ep, has_pplx,
-                        round_up)
+                        round_up, has_triton_kernels)
 from vllm.utils.flashinfer import has_flashinfer_cutlass_fused_moe
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
@@ -417,6 +417,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # Lazy import to avoid importing triton.
         from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
             shuffle_weights)
+        if has_triton_kernels():
+            transposed_w13 = layer.w13_weight.data.transpose(-2, -1).contiguous()
+            transposed_w2 = layer.w2_weight.data.transpose(-2, -1).contiguous()
+
+            layer.w13_weight.data = transposed_w13
+            layer.w2_weight.data = transposed_w2
 
         if self.rocm_aiter_moe_enabled:
             shuffled_w13, shuffled_w2 = shuffle_weights(
@@ -550,6 +556,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if has_triton_kernels():
+            from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import triton_kernel_moe_forward
+            return triton_kernel_moe_forward(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                gating_output=router_logits,
+                topk=top_k,
+                renormalize=renormalize,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
 
         zero_expert_num = getattr(layer, 'zero_expert_num', 0)
         zero_expert_type = getattr(layer, 'zero_expert_type', None)

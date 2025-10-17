@@ -135,13 +135,20 @@ def triton_kernel_fused_experts(
     assert w2.shape[-1] == w1.shape[1]
 
     E, _, N = w1.shape
+    n_expts_act = routing_data.n_expts_act
+    M, K = hidden_states.shape
+    dtype = hidden_states.dtype
 
     if global_num_experts == -1:
         global_num_experts = E
+    
+    intermediate_cache2 = torch.empty((M * n_expts_act, N // 2),
+                                      device="cuda",
+                                      dtype=dtype)
 
     act = FusedActivation(
         FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")),
-        (swiglu_alpha, swiglu_limit), 2)
+        (swiglu_alpha, swiglu_limit), 2) if activation == "oai_swiglu" else None
     gammas = routing_data.gate_scal if routing_data else None
 
     intermediate_cache1 = matmul_ogs(
@@ -153,6 +160,15 @@ def triton_kernel_fused_experts(
         precision_config=quant_config.w1_precision,
         gammas=gammas if apply_router_weight_on_input else None,
         fused_activation=act)
+    
+    if activation == "silu":
+        torch.ops._C.silu_and_mul(intermediate_cache2,
+                                  intermediate_cache1.view(-1, N))
+    elif activation == "gelu":
+        torch.ops._C.gelu_and_mul(intermediate_cache2,
+                                  intermediate_cache1.view(-1, N))
+    else:
+        raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
     intermediate_cache3 = matmul_ogs(
         intermediate_cache1,
