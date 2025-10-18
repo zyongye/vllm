@@ -171,7 +171,7 @@ def triton_kernel_fused_experts(
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
     intermediate_cache3 = matmul_ogs(
-        intermediate_cache1,
+        intermediate_cache2,
         w2,
         quant_config.w2_bias,
         routing_data,

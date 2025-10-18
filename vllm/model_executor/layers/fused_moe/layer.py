@@ -418,8 +418,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
             shuffle_weights)
         if has_triton_kernels():
-            transposed_w13 = layer.w13_weight.data.transpose(-2, -1).contiguous()
-            transposed_w2 = layer.w2_weight.data.transpose(-2, -1).contiguous()
+            transposed_w13 = layer.w13_weight.data.transpose(-2, -1)
+            transposed_w2 = layer.w2_weight.data.transpose(-2, -1)
 
             layer.w13_weight.data = transposed_w13
             layer.w2_weight.data = transposed_w2
