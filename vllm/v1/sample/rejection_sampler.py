@@ -115,17 +115,44 @@ class RejectionSampler(nn.Module):
         # max_spec_token = max(metadata.num_draft_tokens)
         # # draft_token_ids = metadata.draft_token_ids.reshape(num_req, -1)
         # output_token_ids = torch.full((num_req, max_spec_token), -1, device=metadata.draft_token_ids.device)
-
-        for i in range(num_req):
-            num_drafe_token_per_req = metadata.num_draft_tokens[i]
-            token_start = metadata.cu_num_draft_tokens[i]
-            if num_drafe_token_per_req == 0:
-                continue
-            output_token_ids[i, 1:num_drafe_token_per_req] = metadata.draft_token_ids[token_start - num_drafe_token_per_req + 1: token_start]
-
+        
         # print(f"spec_metadata: {metadata}")
         # print(f"draft_token_ids:{metadata.draft_token_ids.shape}")
         # print(f"out_token_ids:{output_token_ids}")
+        
+        for i in range(num_req):
+            num_drafe_token_per_req = metadata.num_draft_tokens[i]
+            token_start = metadata.cu_num_draft_tokens[i]
+            if num_drafe_token_per_req in (0, 1):
+                continue
+            output_token_ids[i, 1:num_drafe_token_per_req - 3] = metadata.draft_token_ids[token_start - num_drafe_token_per_req + 1: token_start - 3]
+
+        # num_draft_tokens = torch.tensor(metadata.num_draft_tokens, device=output_token_ids.device)
+        # lens = (num_draft_tokens - 1).clamp(min=0)
+        # if int(lens.sum().item()) == 0:
+        #     return output_token_ids
+
+        # total = num_draft_tokens.size(0)
+        # first_idx = (metadata.cu_num_draft_tokens - num_draft_tokens)    # first index of each segment
+        # mask = torch.ones(total, dtype=torch.bool, device=output_token_ids.device)
+        # mask[first_idx] = False                                          # drop the first token in every segment
+        # flat_src_idx = mask.nonzero(as_tuple=False).squeeze(1) 
+        
+        # row_idx = torch.repeat_interleave(torch.arange(num_req, device=output_token_ids.device), lens)
+
+        # starts = torch.cumsum(lens, dim=0) - lens                        # start offset of each row block in flat list
+        # pos_in_row = torch.arange(flat_src_idx.numel(), device=output_token_ids.device) \
+        #             - torch.repeat_interleave(starts, lens)             # 0..lens[i]-1 per row
+        # col_idx = 1 + pos_in_row                                         # shift to start at column 1
+
+        # # ---- 3) Scatter into output ----
+        # output_token_ids.index_put_(
+        #     (row_idx, col_idx),
+        #     metadata.draft_token_ids.index_select(0, flat_src_idx),
+        #     accumulate=False
+        # )
+
+        
         
         return output_token_ids
 
