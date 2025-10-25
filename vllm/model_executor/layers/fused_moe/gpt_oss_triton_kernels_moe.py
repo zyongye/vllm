@@ -178,7 +178,7 @@ def ep_routing(
         y_indx=expt_indx,
         n_rows=n_rows,
         all_gather=True,
-        group_name=group_name,
+        # group_name=group_name,
     )
     active_indx = logits_global.indx
     expt_sizes = logits_global.mask_metadata.col_sum
@@ -306,21 +306,21 @@ def triton_kernel_fused_experts(
         2,
     )
     gammas = routing_data.gate_scal if routing_data else None
-    tokens_involved = int(routing_data.expt_hist.sum().item()) if routing_data else 0
+    # tokens_involved = int(routing_data.expt_hist.sum().item()) if routing_data else 0
     hidden_dim = hidden_states.shape[-1]
     interm_dim = w1.shape[-1]
-    flops_matmul_ogs = 2 * tokens_involved * hidden_dim * interm_dim
-    token_num_bytes = hidden_states.element_size() * tokens_involved * hidden_dim
+    # flops_matmul_ogs = 2 * tokens_involved * hidden_dim * interm_dim
+    # token_num_bytes = hidden_states.element_size() * tokens_involved * hidden_dim
     
     def num_bytes(tensor):
         return tensor.numel() * tensor.element_size()
 
     with proton.cpu_timed_scope(
         name="matmul_ogs-w1",
-        metrics={
-            "flops": flops_matmul_ogs, 
-            "bytes": num_bytes(w1) + token_num_bytes
-            }
+        # metrics={
+        #     "flops": flops_matmul_ogs, 
+        #     "bytes": num_bytes(w1) + token_num_bytes
+        #     }
         ):
         intermediate_cache1 = matmul_ogs(
             hidden_states,
@@ -335,10 +335,10 @@ def triton_kernel_fused_experts(
 
     with proton.cpu_timed_scope(
         name="matmul_ogs-w2",
-        metrics={
-            "flops": flops_matmul_ogs, 
-            "bytes": num_bytes(w1) + token_num_bytes
-            }
+        # metrics={
+        #     "flops": flops_matmul_ogs, 
+        #     "bytes": num_bytes(w1) + token_num_bytes
+        #     }
         ):
         intermediate_cache3 = matmul_ogs(
             intermediate_cache1,

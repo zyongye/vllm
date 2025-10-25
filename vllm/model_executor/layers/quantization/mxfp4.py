@@ -55,7 +55,7 @@ from vllm.utils.import_utils import has_triton_kernels
 from vllm.utils.torch_utils import is_torch_equal_or_newer
 from vllm.distributed import get_dp_group, get_ep_group
 
-from triton_kenerls.distributed import symm_mem_pool
+from triton_kernels.distributed import symm_mem_pool
 
 logger = init_logger(__name__)
 
@@ -203,8 +203,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             self.expt_assignment = create_expt_assignment(EP=moe.ep_size, n_expts_tot=moe.num_experts, device=torch.cuda.current_device())
             self.symm_mem_pool = symm_mem_pool.initialize(
-                1024 * 1024,
-                dtype=torch.uint8,
+                5 * 1024 * 1024 * 1024,
+                n_ranks=get_dp_group().world_size,
                 device=torch.cuda.current_device(),
                 group=get_dp_group().device_group
             )
@@ -1138,7 +1138,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     global_num_experts=global_num_experts,
                     expert_map=expert_map,
                     expt_assignment = self.expt_assignment,
-                    symm_mem_pool = self.symm_mem_pool,
+                    # symm_mem_pool = self.symm_mem_pool,
                     quant_config=self.moe_quant_config,
                     apply_router_weight_on_input=apply_router_weight_on_input,
                 )
