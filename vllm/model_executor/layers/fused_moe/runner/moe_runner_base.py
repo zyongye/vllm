@@ -82,6 +82,7 @@ def _resolve_layer_name(layer_name: str | LayerName) -> str:
 def _moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None,
     shared_experts_input: torch.Tensor | None,
     layer_name: _layer_name_type,
 ) -> torch.Tensor:
@@ -90,6 +91,7 @@ def _moe_forward(
         layer,
         hidden_states,
         router_logits,
+        input_ids,
         shared_experts_input,
     )
 
@@ -97,6 +99,7 @@ def _moe_forward(
 def _moe_forward_fake(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None,
     shared_experts_input: torch.Tensor | None,
     layer_name: _layer_name_type,
 ) -> torch.Tensor:
@@ -106,6 +109,7 @@ def _moe_forward_fake(
 def _moe_forward_shared(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None,
     shared_experts_input: torch.Tensor | None,
     layer_name: _layer_name_type,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -114,6 +118,7 @@ def _moe_forward_shared(
         layer,
         hidden_states,
         router_logits,
+        input_ids,
         shared_experts_input,
     )
 
@@ -121,6 +126,7 @@ def _moe_forward_shared(
 def _moe_forward_shared_fake(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None,
     shared_experts_input: torch.Tensor | None,
     layer_name: _layer_name_type,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -384,6 +390,7 @@ class MoERunnerBase(MoERunner):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         # Run this before quant_method to avoid inplace issues.
         # TODO(bnell): probably not needed anymore since inplace is
@@ -402,6 +409,7 @@ class MoERunnerBase(MoERunner):
             topk_weights, topk_ids = self.router.select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
+                input_ids=input_ids,
             )
 
             # Passing shared_experts_input in case SharedExpertsOrder is
@@ -447,12 +455,14 @@ class MoERunnerBase(MoERunner):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Invoke the fused moe layer.
 
         Input:
         - hidden_states
         - router_logits
+        - input_ids (optional, used for hash-based routing in DeepseekV4)
 
         Output:
         - The new hidden_states.
@@ -490,6 +500,7 @@ class MoERunnerBase(MoERunner):
         fused_output = self.forward_entry(
             hidden_states,
             router_logits,
+            input_ids,
             shared_experts_input,
             self._encode_layer_name(),
         )
@@ -501,6 +512,7 @@ class MoERunnerBase(MoERunner):
         layer: torch.nn.Module,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # TODO(bnell): this can be removed after MK migration is complete.
@@ -520,6 +532,7 @@ class MoERunnerBase(MoERunner):
                 layer,
                 hidden_states,
                 router_logits,
+                input_ids,
                 shared_experts_input,
             )
 
@@ -529,6 +542,7 @@ class MoERunnerBase(MoERunner):
         layer: torch.nn.Module,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError

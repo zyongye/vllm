@@ -153,6 +153,7 @@ class ChunkingMoERunner(MoERunnerBase):
         layer: torch.nn.Module,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         final_shared_hidden_states, final_fused_hidden_states = (
@@ -213,6 +214,7 @@ class ChunkingMoERunner(MoERunnerBase):
                     layer=layer,
                     hidden_states=hidden_states_chunk,
                     router_logits=router_logits_chunk,
+                    input_ids=input_ids,
                     shared_experts_input=shared_experts_input_chunk,
                 )
 

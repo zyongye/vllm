@@ -1844,6 +1844,7 @@ def create_scheduler_with_priority(
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
         block_size=block_size,
+        hash_block_size=block_size,
     )
 
 
@@ -3960,6 +3961,7 @@ def _create_encoder_decoder_scheduler(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         block_size=block_size,
+        hash_block_size=block_size,
         structured_output_manager=StructuredOutputManager(vllm_config),
     )
 

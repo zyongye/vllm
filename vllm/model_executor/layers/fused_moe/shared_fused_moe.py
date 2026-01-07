@@ -18,10 +18,12 @@ class SharedFusedMoE(FusedMoE):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         result = super().forward(
             hidden_states=hidden_states,
             router_logits=router_logits,
+            input_ids=input_ids,
         )
         if self.shared_experts is None:
             return None, result

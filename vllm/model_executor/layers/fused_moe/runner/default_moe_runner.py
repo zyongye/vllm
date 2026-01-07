@@ -52,6 +52,7 @@ class DefaultMoERunner(MoERunnerBase):
         layer: torch.nn.Module,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # For naive dispatch/combine Dp/Ep, dispatch the hidden states and
         # router logits to all experts.
@@ -106,6 +107,7 @@ class DefaultMoERunner(MoERunnerBase):
         layer: torch.nn.Module,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # TODO(bnell): parts of the dispatch/combine steps will go away once
@@ -115,6 +117,7 @@ class DefaultMoERunner(MoERunnerBase):
             layer,
             hidden_states,
             router_logits,
+            input_ids=input_ids,
         )
 
         shared_output, hidden_states = self._apply_quant_method(
@@ -122,6 +125,7 @@ class DefaultMoERunner(MoERunnerBase):
             hidden_states=hidden_states,
             router_logits=router_logits,
             shared_experts_input=shared_experts_input,
+            input_ids=input_ids,
         )
 
         return self._maybe_combine(
