@@ -724,6 +724,207 @@ def _silu_mul_per_token_group_quant_fp8_colmajor(
     tl.store(y_s_ptrs, y_s)
 
 
+@triton.jit
+def _silu_mul_quant_fp8_packed_kernel(
+    # Input tensor [M, N] where N = 2 * hidden_dim
+    input_ptr,
+    # Output quantized tensor [M, N // 2]
+    output_q_ptr,
+    # Output packed scales [M, num_packed_groups] with TMA-aligned stride
+    output_scale_ptr,
+    # Dimensions
+    M,  # Number of tokens
+    # Strides
+    input_stride_m,
+    output_q_stride_m,
+    output_scale_stride_k,  # TMA-aligned stride for packed scales
+    # Quantization parameters
+    eps,
+    # Compile-time constants
+    N: tl.constexpr,  # Input hidden dimension (2 * output hidden dimension)
+    NUM_GROUPS: tl.constexpr,  # Number of groups per row (N // 2 // GROUP_SIZE)
+    fp8_min: tl.constexpr,
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """
+    Fused Triton kernel for:
+    1. SiLU activation + element-wise multiplication (gated activation)
+    2. Per-token-group FP8 quantization with UE8M0 (power-of-2) scales
+    3. Pack 4 UE8M0 exponents into int32 for DeepGEMM
+
+    Grid: (num_packed_groups, ceil(M / BLOCK_M))
+    Each thread block processes BLOCK_M rows and 4 groups (one packed int32).
+    """
+    # Compile-time constant for output hidden dimension
+    N_2: tl.constexpr = N // 2
+
+    # Program IDs
+    pid_pack = tl.program_id(0)  # Which packed group (0, 1, 2, ...)
+    pid_m = tl.program_id(1)  # Which block of rows
+    m_offset = pid_m * BLOCK_M
+
+    # Early exit if out of bounds
+    if m_offset >= M:
+        return
+
+    # Precompute offsets (reused across groups)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, GROUP_SIZE)
+    row_mask = (m_offset + offs_m) < M
+
+    # Base pointers for this row block
+    base_row_offset = (m_offset + offs_m[:, None]) * input_stride_m
+    base_out_offset = (m_offset + offs_m[:, None]) * output_q_stride_m
+
+    # Initialize packed scale value
+    packed_scale = tl.zeros((BLOCK_M,), dtype=tl.int32)
+
+    # Process 4 groups for this packed int32
+    # Use tl.static_range for compile-time unrolling
+    for pack_idx in tl.static_range(4):
+        group_id = pid_pack * 4 + pack_idx
+
+        # Check if this group exists (compile-time check when possible)
+        if group_id < NUM_GROUPS:
+            n_offset = group_id * GROUP_SIZE
+
+            # Load input for SiLU part: input[:, :N_2]
+            act_ptrs = input_ptr + base_row_offset + n_offset + offs_n[None, :]
+            act_in = tl.load(act_ptrs, mask=row_mask[:, None], other=0.0)
+
+            # Load input for mul part: input[:, N_2:]
+            mul_ptrs = act_ptrs + N_2
+            mul_in = tl.load(mul_ptrs, mask=row_mask[:, None], other=0.0)
+
+            # SiLU activation: x * sigmoid(x) = x / (1 + exp(-x))
+            # Fused computation to reduce register pressure
+            act_f32 = act_in.to(tl.float32)
+            y = (act_f32 / (1.0 + tl.exp(-act_f32))) * mul_in.to(tl.float32)
+
+            # Per-group quantization with UE8M0 scales
+            # Find max absolute value in each row for this group
+            absmax = tl.max(tl.abs(y), axis=1)  # [BLOCK_M]
+
+            # Compute UE8M0 scale: power-of-2 scale
+            # scale = 2^ceil(log2(max(absmax/fp8_max, 1e-10)))
+            scale_raw = tl.maximum(absmax / fp8_max, 1e-10)
+            exponent = tl.ceil(tl.log2(scale_raw))
+            scale = tl.math.exp2(exponent)
+
+            # Quantize: y_q = clamp(y / scale, fp8_min, fp8_max)
+            y_q = tl.clamp(y / scale[:, None], fp8_min, fp8_max)
+
+            # Store quantized output
+            out_q_ptrs = output_q_ptr + base_out_offset + n_offset + offs_n[None, :]
+            tl.store(
+                out_q_ptrs,
+                y_q.to(output_q_ptr.dtype.element_ty),
+                mask=row_mask[:, None],
+            )
+
+            # Compute UE8M0 exponent (biased by 127) and pack
+            # Clamp in float32 before converting to int32 (tl.clamp only supports float)
+            exponent_biased = tl.clamp(exponent + 127.0, 0.0, 255.0).to(tl.int32)
+            packed_scale = packed_scale | (exponent_biased << (pack_idx * 8))
+
+    # Store the packed scale value
+    # Scale layout: [M, num_packed_groups] with stride (1, tma_aligned_mn)
+    scale_ptrs = output_scale_ptr + pid_pack * output_scale_stride_k + m_offset + offs_m
+    tl.store(scale_ptrs, packed_scale, mask=row_mask)
+
+
+def silu_mul_quant_fp8_packed_triton(
+    input: torch.Tensor,
+    group_size: int = 128,
+    eps: float = 1e-10,
+    output_q: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused SiLU+mul activation and FP8 quantization with packed UE8M0 scales.
+
+    This Triton kernel is equivalent to:
+        act_out = silu_and_mul(input)
+        a2q, a2q_scale = per_token_group_quant_fp8_packed_for_deepgemm(act_out, group_size)
+
+    Args:
+        input: Input tensor of shape [M, N] where N = 2 * hidden_dim
+        group_size: Quantization group size (default 128)
+        eps: Small value to avoid division by zero
+        output_q: Optional pre-allocated output tensor for quantized values
+
+    Returns:
+        (output_q, output_scale_packed):
+            output_q: FP8 tensor of shape [M, N // 2]
+            output_scale_packed: Int32 tensor with packed UE8M0 scales
+                                 Shape: [M, ceil(num_groups_per_row / 4)]
+                                 Stride: (1, tma_aligned_M)
+    """
+    assert input.dim() == 2, "Input must be 2D tensor"
+    assert input.is_contiguous(), "Input must be contiguous"
+
+    M, N = input.shape
+    N_2 = N // 2  # Output hidden dimension
+
+    assert N_2 % group_size == 0, (
+        f"N//2 ({N_2}) must be divisible by group_size ({group_size})"
+    )
+
+    # Get FP8 info
+    fp8_dtype = torch.float8_e4m3fn
+    finfo = torch.finfo(fp8_dtype)
+    fp8_min, fp8_max = finfo.min, finfo.max
+
+    # Compute dimensions
+    num_groups_per_row = N_2 // group_size
+    num_packed_groups = (num_groups_per_row + 3) // 4
+    tma_aligned_M = ((M + 3) // 4) * 4
+
+    # Allocate output tensors
+    if output_q is None:
+        output_q = torch.empty((M, N_2), dtype=fp8_dtype, device=input.device)
+
+    # Packed scales with TMA-aligned stride
+    output_scale_packed = torch.zeros(
+        (num_packed_groups, tma_aligned_M),
+        dtype=torch.int32,
+        device=input.device,
+    ).T[:M, :]  # View as [M, num_packed_groups] with stride (1, tma_aligned_M)
+
+    # Launch kernel with 2D grid: (num_packed_groups, ceil(M / BLOCK_M))
+    BLOCK_M = 8
+    grid = (num_packed_groups, (M + BLOCK_M - 1) // BLOCK_M)
+
+    # Tuning parameters
+    # num_warps: 4 warps (128 threads) is good for GROUP_SIZE=128
+    # num_stages: software pipelining for memory latency hiding
+    num_warps = max(4, group_size // 32)
+    num_stages = 2
+
+    _silu_mul_quant_fp8_packed_kernel[grid](
+        input,
+        output_q,
+        output_scale_packed,
+        M,
+        input.stride(0),
+        output_q.stride(0),
+        output_scale_packed.stride(1),
+        eps,
+        # Compile-time constants
+        N=N,
+        NUM_GROUPS=num_groups_per_row,
+        fp8_min=fp8_min,
+        fp8_max=fp8_max,
+        GROUP_SIZE=group_size,
+        BLOCK_M=BLOCK_M,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+    return output_q, output_scale_packed
+
+
 def silu_mul_per_token_group_quant_fp8_colmajor(
     input: torch.Tensor,  # [M, N]
     output: torch.Tensor | None = None,  # [M, N // 2]

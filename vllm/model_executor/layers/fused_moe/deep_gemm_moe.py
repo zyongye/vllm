@@ -22,7 +22,6 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
-    per_token_group_quant_fp8_packed_for_deepgemm,
     silu_mul_per_token_group_quant_fp8_colmajor,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -199,16 +198,11 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
         # 1. DeepGemm UE8M0: use packed per-token-group quant
         if scale_fmt == DeepGemmQuantScaleFMT.UE8M0:
-            act_out = torch.empty(
-                (M_sum, activation_out_dim), dtype=input.dtype, device=input.device
+            return fused_silu_mul_fp8_quant_packed(
+                input=input,
+                output_q=output,
+                group_size=block_k,
             )
-            self.activation(activation, act_out, input)
-            a2q, a2q_scale = per_token_group_quant_fp8_packed_for_deepgemm(
-                act_out,
-                block_k,
-                out_q=output,
-            )
-            return a2q, a2q_scale
 
         # 2. Hopper / non‑E8M0: prefer the fused SiLU+mul+quant kernel
         if activation == MoEActivation.SILU:
