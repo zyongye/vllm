@@ -2413,9 +2413,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             window_left=-1,
             cum_seq_lens_q=prefill.query_start_loc,
             cum_seq_lens_kv=prefill.query_start_loc,
-            enable_pdl=False,
+            enable_pdl=True,
             is_causal=True,
-            return_lse=return_softmax_lse,
+            return_lse=False,
             out=out,
         )
 

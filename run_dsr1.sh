@@ -47,9 +47,7 @@ echo "DP=$DP, DP_LOCAL=$DP_LOCAL, DP_START_RANK=$DPSR, MASTER_ADDR=$MASTER_ADDR"
 
 # Backend params
 export VLLM_ENABLE_MOE_DP_CHUNK=0
-export VLLM_ATTENTION_BACKEND=FLASHINFER_MLA
 export VLLM_USE_FLASHINFER_MOE_FP4=1
-export VLLM_USE_TRTLLM_RAGGED_DEEPSEEK_PREFILL=1
 export VLLM_FLASHINFER_MOE_BACKEND=latency
 export VLLM_RANDOMIZE_DP_DUMMY_INPUTS=1
 
@@ -94,6 +92,7 @@ MODEL=nvidia/Kimi-K2.5-NVFP4
 # -O3 \
 # COMPILATION_CONFIG='{"cudagraph_mode":"FULL_AND_PIECEWISE"}'
 # --compilation-config "$COMPILATION_CONFIG" \
+# --load-format fastsafetensors \
 ENGINE_ARGS="
     -dp $DP \
     -ep \
@@ -101,12 +100,14 @@ ENGINE_ARGS="
     --trust-remote-code \
     --language-model-only \
     --attention_config.disable_flashinfer_prefill false \
-    --gpu-memory-utilization 0.85 \
+    --attention_config.use_prefill_query_quantization true \
+    --attention_config.use_trtllm_ragged_deepseek_prefill true \
+    --gpu-memory-utilization 0.9 \
     --data-parallel-size-local $DP_LOCAL \
     --data-parallel-address $MASTER_ADDR \
     --data-parallel-hybrid-lb \
-    --load-format fastsafetensors \
     --max-model-len 9216 \
+    --max-num-batched-tokens 16384 \
     --kv-transfer-config {\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"fail\",\"kv_buffer_device\":\"cuda\",\"kv_connector_extra_config\":{\"enforce_handshake_compat\":false}} \
     --disable-uvicorn-access-log \
     --kv-cache-dtype fp8 \
