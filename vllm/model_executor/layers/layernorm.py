@@ -309,13 +309,14 @@ class RMSNorm(CustomOp):
                     )
                     return x, residual
 
-        if residual is not None:
-            return fused_add_rms_norm(
-                x, residual, self.weight.data, self.variance_epsilon
-            )
+        from flashinfer.norm import fused_add_rmsnorm, rmsnorm
+
+        add_residual = residual is not None
+        if add_residual:
+            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+            return x, residual
         else:
-            assert envs.VLLM_BATCH_INVARIANT
-            return rms_norm_batch_invariant(x, self.weight.data, self.variance_epsilon)
+            return rmsnorm(x, self.weight.data, self.variance_epsilon)
 
     def forward_hip(
         self,
