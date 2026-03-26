@@ -2263,7 +2263,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         return attn_out
 
     def _run_prefill_new_tokens_fa(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+        self,
+        prefill: MLACommonPrefillMetadata,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        out=None,
     ):
         return self._flash_attn_varlen_diff_headdims(
             q=q,
@@ -2279,7 +2285,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         )
 
     def _run_prefill_new_tokens_fi(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+        self,
+        prefill: MLACommonPrefillMetadata,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        out=None,
     ):
         assert isinstance(prefill, FlashInferPrefillMetadata)
         assert prefill.prefill_main is not None
@@ -2296,7 +2308,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         return ret
 
     def _run_prefill_new_tokens_cudnn(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+        self,
+        prefill: MLACommonPrefillMetadata,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        out=None,
     ):
         assert isinstance(prefill, CudnnPrefillMetadata)
         assert prefill.query_seq_lens is not None
@@ -2382,7 +2400,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         )
 
     def _run_prefill_new_tokens_trtllm_ragged(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+        self,
+        prefill: MLACommonPrefillMetadata,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        out=None,
     ):
         """TRT-LLM ragged attention for new tokens (causal)."""
         from flashinfer.prefill import trtllm_ragged_attention_deepseek
@@ -2390,13 +2414,14 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         assert prefill.query_seq_lens is not None
         assert prefill.workspace_buffer is not None
         # allocate BF16 / FP16 output tensor for TRT-LLM ragged attention
-        out = torch.empty(
-            q.shape[0],
-            q.shape[1],
-            v.shape[2],
-            device=q.device,
-            dtype=prefill.output_dtype,
-        )
+        if out is None:
+            out = torch.empty(
+                q.shape[0],
+                q.shape[1],
+                v.shape[2],
+                device=q.device,
+                dtype=prefill.output_dtype,
+            )
 
         ret = trtllm_ragged_attention_deepseek(
             query=q,
@@ -2737,16 +2762,15 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             k = k.to(prefill_metadata.q_data_type)
             v = v.to(prefill_metadata.q_data_type)
 
-        output_prefill = self._run_prefill_new_tokens(
-            prefill=prefill_metadata,
-            q=q,
-            k=k,
-            v=v,
-            return_softmax_lse=has_context,
-        )
-
         if has_context:
             assert prefill_metadata.chunked_context is not None
+            output_prefill = self._run_prefill_new_tokens(
+                prefill=prefill_metadata,
+                q=q,
+                k=k,
+                v=v,
+                return_softmax_lse=True,
+            )
             suffix_output, suffix_lse = output_prefill
             if self.dcp_world_size > 1:
                 context_output, context_lse = (
@@ -2777,9 +2801,27 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 suffix_lse=suffix_lse,
                 prefill_tokens_with_context=prefill_metadata.chunked_context.prefill_tokens_with_context,
             )
-        else:
+        elif self._pad_v:
+            output_prefill = self._run_prefill_new_tokens(
+                prefill=prefill_metadata,
+                q=q,
+                k=k,
+                v=v,
+                return_softmax_lse=False,
+            )
             output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
             output.copy_(output_prefill)
+        else:
+            # Write directly into the output buffer, avoiding a copy
+            out_3d = output.view(-1, self.num_heads, self.v_head_dim)
+            self._run_prefill_new_tokens(
+                prefill=prefill_metadata,
+                q=q,
+                k=k,
+                v=v,
+                return_softmax_lse=False,
+                out=out_3d,
+            )
 
     @abstractmethod
     def forward_mqa(
