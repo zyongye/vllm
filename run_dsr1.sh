@@ -15,6 +15,7 @@ DP=4
 DP_LOCAL=4
 DPSR=0
 MASTER_ADDR=$IP
+PROFILE=0
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -34,6 +35,10 @@ while [[ $# -gt 0 ]]; do
         --master-addr)
             MASTER_ADDR="$2"
             shift 2
+            ;;
+        --profile|-p)
+            PROFILE=1
+            shift
             ;;
         *)
             echo "Unknown option: $1"
@@ -87,6 +92,9 @@ export NCCL_DEBUG=WARN
 export VLLM_NIXL_SIDE_CHANNEL_HOST=${IP}
 export VLLM_NIXL_SIDE_CHANNEL_PORT=5600
 
+# ---- PDL ----
+export VLLM_ENABLE_PDL=1
+
 # Engine arguments
 MODEL=nvidia/Kimi-K2.5-NVFP4
 # -O3 \
@@ -102,7 +110,7 @@ ENGINE_ARGS="
     --attention_config.disable_flashinfer_prefill false \
     --attention_config.use_prefill_query_quantization true \
     --attention_config.use_trtllm_ragged_deepseek_prefill true \
-    --gpu-memory-utilization 0.9 \
+    --gpu-memory-utilization 0.85 \
     --data-parallel-size-local $DP_LOCAL \
     --data-parallel-address $MASTER_ADDR \
     --data-parallel-hybrid-lb \
@@ -114,13 +122,23 @@ ENGINE_ARGS="
     --no-enable-prefix-caching \
 "
 
+PROFILE_CMD=""
+if [ "$PROFILE" -eq 1 ]; then
+    PROFILE_CMD="nsys profile \
+        -o /home/yongye/vllm/traces/dsr1_%h_%p \
+        --trace-fork-before-exec=true \
+        --cuda-graph-trace=node \
+        --capture-range=cudaProfilerApi \
+        --capture-range-end repeat"
+    ENGINE_ARGS+=" --profiler-config {\"profiler\":\"cuda\",\"delay_iterations\":30,\"max_iterations\":100}"
+fi
+
 # Needed for MNNVL
 ENGINE_ARGS+=" --enable-sleep-mode"
 # Worker nodes need --data-parallel-start-rank
 if [ "$DPSR" -gt 0 ]; then
     ENGINE_ARGS+=" --data-parallel-start-rank $DPSR"
 fi
-
 # Use LOG_DIR and hostname to avoid collision when multiple instances run
 LOG_FILE="${LOG_DIR:-.}/prefill-worker-${DPSR}-$(hostname -s).log"
-vllm serve $MODEL $ENGINE_ARGS 2>&1 | tee "$LOG_FILE"
+$PROFILE_CMD vllm serve $MODEL $ENGINE_ARGS 2>&1 | tee "$LOG_FILE"
