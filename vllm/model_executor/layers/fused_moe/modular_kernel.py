@@ -1276,7 +1276,7 @@ class FusedMoEKernelModularImpl:
         if not self.prepare_finalize.supports_async():
             assert not dbo_enabled()
 
-            self.prepare_finalize.finalize(
+            result = self.prepare_finalize.finalize(
                 output,
                 fused_out,
                 topk_weights,
@@ -1284,6 +1284,8 @@ class FusedMoEKernelModularImpl:
                 apply_router_weight_on_input,
                 self.fused_experts.finalize_weight_and_reduce_impl(),
             )
+            if result is not None:
+                output = result 
         else:
             finalize_ret = self.prepare_finalize.finalize_async(
                 output,
@@ -1358,10 +1360,21 @@ class FusedMoEKernelModularImpl:
         Returns:
         - torch.Tensor: The output tensor after applying the MoE layer.
         """
+        from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+            TopKWeightAndReduceNoOP,
+        )
+
         if self.inplace:
             assert self.shared_experts is None
             assert not disable_inplace()
             output = hidden_states
+        elif isinstance(
+            self.fused_experts.finalize_weight_and_reduce_impl(),
+            TopKWeightAndReduceNoOP,
+        ):
+            # The experts kernel already did weight application and reduction.
+            # Skip output allocation — finalize will return the result directly.
+            output = None
         else:
             output = torch.empty_like(hidden_states)
 
