@@ -2737,10 +2737,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         prefill_metadata = attn_metadata.prefill
         use_fp8_prefill = prefill_metadata.q_data_type == current_platform.fp8_dtype()
 
-        # Convert q to FP8 if FP8 prefill attention is enabled
-        if use_fp8_prefill:
-            q = q.to(prefill_metadata.q_data_type)
-
         has_context = prefill_metadata.chunked_context is not None
 
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
@@ -2749,9 +2745,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
+        # Convert q to FP8 if FP8 prefill attention is enabled
         if use_fp8_prefill:
-            k = k.to(prefill_metadata.q_data_type)
-            v = v.to(prefill_metadata.q_data_type)
+            q, k, v = ops.mla_fp8_quantize_qkv(q, k, v)
 
         if has_context:
             assert prefill_metadata.chunked_context is not None

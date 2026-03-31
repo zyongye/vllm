@@ -244,6 +244,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool is_scale_transposed=False) -> ()");
   ops.impl("silu_and_mul_per_block_quant", torch::kCUDA,
            &silu_and_mul_per_block_quant);
+  // MLA fused FP8 quantization of Q+K+V (DeepSeek V3 shapes, non-absorption).
+  ops.def(
+      "mla_fp8_quantize_qkv(Tensor q, Tensor! q_out, Tensor k, Tensor! k_out, "
+      "Tensor v, Tensor! v_out, float scale) -> ()");
+  ops.impl("mla_fp8_quantize_qkv", torch::kCUDA, &mla_fp8_quantize_qkv);
+
   // DeepSeek V3 fused A GEMM (SM 9.0+, bf16 only, 1-16 tokens).
   ops.def(
       "dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");

@@ -2723,6 +2723,40 @@ def cp_gather_and_upconvert_fp8_kv_cache(
     )
 
 
+def mla_fp8_quantize_qkv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused FP8 quantization of Q, K, V for MLA non-absorption mode.
+
+    Replaces the Triton fused_fp8_quantize kernel. Fixed for DeepSeek V3
+    shapes (QK_NOPE=128, QK_ROPE=64, V=128, num_heads=128).
+
+    V may be non-contiguous (as produced by kv_nope.split()); the kernel
+    reads it with stride (QK_NOPE + V_DIM) * num_heads per token.
+
+    Args:
+        q: [n_tokens, num_heads, QK_HEAD_DIM]  bf16 or fp16
+        k: [n_tokens, num_heads, QK_HEAD_DIM]  bf16 or fp16
+        v: [n_tokens, num_heads, V_HEAD_DIM]   bf16 or fp16 (non-contiguous ok)
+        scale: per-tensor quantization scale (default 1.0)
+
+    Returns:
+        (q_fp8, k_fp8, v_fp8) — contiguous fp8_e4m3fn tensors
+    """
+    q_out = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+    k_out = torch.empty_like(k, dtype=torch.float8_e4m3fn)
+    v_out = torch.empty(
+        v.shape[0], v.shape[1], v.shape[2],
+        dtype=torch.float8_e4m3fn,
+        device=v.device,
+    )
+    torch.ops._C.mla_fp8_quantize_qkv(q, q_out, k, k_out, v, v_out, scale)
+    return q_out, k_out, v_out
+
+
 def concat_mla_q(
     ql_nope: torch.Tensor,
     q_pe: torch.Tensor,

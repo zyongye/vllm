@@ -311,3 +311,12 @@ int64_t qr_max_size();
 void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a,
                        torch::Tensor const& mat_b);
 #endif
+
+#ifndef USE_ROCM
+// Fused FP8 quantization of Q, K, V for MLA non-absorption mode.
+// Fixed for DeepSeek V3 shapes: QK_NOPE=128, QK_ROPE=64, V=128.
+void mla_fp8_quantize_qkv(torch::Tensor const& q, torch::Tensor& q_out,
+                           torch::Tensor const& k, torch::Tensor& k_out,
+                           torch::Tensor const& v, torch::Tensor& v_out,
+                           double scale);
+#endif
