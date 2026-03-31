@@ -599,6 +599,53 @@ if has_flashinfer():
         # A is [m, k], B is [k, n] -> output [m, n]
         return torch.empty(A.shape[0], B.shape[1], dtype=out_dtype, device=A.device)
 
+    @torch.library.custom_op(
+        "vllm::flashinfer_rmsnorm",
+        mutates_args=[],
+        device_types="cuda",
+    )
+    def flashinfer_rmsnorm(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        variance_epsilon: float,
+    ) -> torch.Tensor:
+        from flashinfer.norm import rmsnorm
+
+        return rmsnorm(x, weight, variance_epsilon)
+
+    @torch.library.register_fake("vllm::flashinfer_rmsnorm")
+    def flashinfer_rmsnorm_fake(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        variance_epsilon: float,
+    ) -> torch.Tensor:
+        return torch.empty_like(x)
+
+    def _flashinfer_fused_add_rmsnorm(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        variance_epsilon: float,
+    ) -> None:
+        from flashinfer.norm import fused_add_rmsnorm
+
+        fused_add_rmsnorm(x, residual, weight, variance_epsilon)
+
+    def _flashinfer_fused_add_rmsnorm_fake(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        variance_epsilon: float,
+    ) -> None:
+        return
+
+    direct_register_custom_op(
+        op_name="flashinfer_fused_add_rmsnorm",
+        op_func=_flashinfer_fused_add_rmsnorm,
+        mutates_args=["x", "residual"],
+        fake_impl=_flashinfer_fused_add_rmsnorm_fake,
+    )
+
 
 def flashinfer_mm_mxfp8(
     a: torch.Tensor,

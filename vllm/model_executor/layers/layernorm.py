@@ -309,14 +309,16 @@ class RMSNorm(CustomOp):
                     )
                     return x, residual
 
-        from flashinfer.norm import fused_add_rmsnorm, rmsnorm
-
         add_residual = residual is not None
         if add_residual:
-            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+            torch.ops.vllm.flashinfer_fused_add_rmsnorm(
+                x, residual, self.weight.data, self.variance_epsilon
+            )
             return x, residual
         else:
-            return rmsnorm(x, self.weight.data, self.variance_epsilon)
+            return torch.ops.vllm.flashinfer_rmsnorm(
+                x, self.weight.data, self.variance_epsilon
+            )
 
     def forward_hip(
         self,
