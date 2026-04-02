@@ -531,6 +531,4 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             decode=decode_metadata,
         )
 
-        # if get_tensor_model_parallel_rank() == 0:
-        #     logger.info(f"attn_metadata: {attn_metadata}")
         return attn_metadata
