@@ -37,8 +37,9 @@
 #include <mutex>
 
 inline int getSMVersion() {
-  auto* props = at::cuda::getCurrentDeviceProperties();
-  return props->major * 10 + props->minor;
+  int major = get_device_attribute(cudaDevAttrComputeCapabilityMajor, -1);
+  int minor = get_device_attribute(cudaDevAttrComputeCapabilityMinor, -1);
+  return major * 10 + minor;
 }
 
 inline bool getEnvEnablePDL() {

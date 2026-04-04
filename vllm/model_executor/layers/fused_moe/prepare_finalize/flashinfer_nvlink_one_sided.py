@@ -143,4 +143,6 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             payload=fused_expert_output,
             runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
         )
+        if output is None:
+            return combined_output
         output.copy_(combined_output)
