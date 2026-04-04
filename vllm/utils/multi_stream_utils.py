@@ -2,9 +2,27 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from enum import Enum
 from typing import Any
 
 import torch
+
+aux_stream_name_list = [
+    "Attention",
+    "MoeShared",
+    # 'MoeChunkingOverlap',
+    # 'MoeBalancer',
+    # 'MoeOutputMemset',
+]
+AuxStreamType = Enum(
+    "AuxStreamType",
+    aux_stream_name_list,
+)
+EventType = Enum(
+    "EventType",
+    ["Main", *aux_stream_name_list],
+    start=0,
+)
 
 
 def maybe_execute_in_parallel(

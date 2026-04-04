@@ -79,6 +79,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.multi_stream_utils import AuxStreamType
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.indexer import (
@@ -743,7 +744,7 @@ def _min_latency_fused_qkv_a_proj_impl(
     does not support runtime dispatching on num_tokens.
     """
     num_tokens = input_.shape[0]
-    if 0 < num_tokens <= 16:
+    if 0 < num_tokens <= 32:
         output = torch.empty(
             num_tokens,
             weight.shape[0],
@@ -843,6 +844,7 @@ class DeepseekV2MLAAttention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
+        aux_stream: torch.cuda.Stream | None = None,
         input_size: int | None = None,
     ) -> None:
         super().__init__()
@@ -980,6 +982,7 @@ class DeepseekV2MLAAttention(nn.Module):
             indexer_rotary_emb=self.indexer_rope_emb,
             is_sparse=self.is_v32,
             topk_indices_buffer=topk_indices_buffer,
+            aux_stream=aux_stream,
         )
 
         self.mla_attn = MultiHeadLatentAttentionWrapper(
@@ -1013,6 +1016,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         prefix: str,
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream] | None = None,
     ) -> None:
         super().__init__()
 
@@ -1063,6 +1067,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
             topk_indices_buffer=topk_indices_buffer,
+            aux_stream=aux_stream_dict[AuxStreamType.Attention],
         )
 
         if (
@@ -1152,6 +1157,12 @@ class DeepseekV2Model(nn.Module):
         self.config = config
         self.device = current_platform.device_type
 
+        aux_stream_list = [torch.cuda.Stream() for _ in range(2)]
+        self.aux_stream_dict = {
+            AuxStreamType.Attention: aux_stream_list[0],
+            AuxStreamType.MoeShared: aux_stream_list[0],
+        }
+
         self.vocab_size = config.vocab_size
         self.is_v32 = hasattr(config, "index_topk")
         if self.is_v32:
@@ -1177,7 +1188,10 @@ class DeepseekV2Model(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV2DecoderLayer(
-                vllm_config, prefix, topk_indices_buffer=topk_indices_buffer
+                vllm_config,
+                prefix,
+                topk_indices_buffer=topk_indices_buffer,
+                aux_stream_dict=self.aux_stream_dict,
             ),
             prefix=f"{prefix}.layers",
         )

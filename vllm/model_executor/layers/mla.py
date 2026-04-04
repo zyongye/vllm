@@ -8,6 +8,7 @@ from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 
 @dataclass
@@ -27,6 +28,7 @@ class MLAModules:
     is_sparse: bool
     topk_indices_buffer: torch.Tensor | None
     indexer_rotary_emb: torch.nn.Module | None = None
+    aux_stream: torch.cuda.Stream | None = None
 
 
 # --8<-- [start:multi_head_latent_attention]
@@ -87,6 +89,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
 
+        self.aux_stream = mla_modules.aux_stream
+        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+
         if self.indexer is not None:
             assert hasattr(self.indexer, "topk_tokens")
             self.topk_tokens = self.indexer.topk_tokens
@@ -135,8 +140,13 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
                 dim=-1,
             )
-            q_c = self.q_a_layernorm(q_c)
-            kv_c_normed = self.kv_a_layernorm(kv_c)
+            q_c, kv_c_normed = maybe_execute_in_parallel(
+                lambda: self.q_a_layernorm(q_c),
+                lambda: self.kv_a_layernorm(kv_c),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
             q = self.q_b_proj(q_c)[0]
         else:
             assert self.kv_a_proj_with_mqa is not None, (
