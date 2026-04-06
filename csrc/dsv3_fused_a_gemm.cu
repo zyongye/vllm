@@ -43,7 +43,7 @@ inline bool getEnvEnablePDL() {
   static bool enablePDL = false;
   std::call_once(flag, [&]() {
     if (getSMVersion() >= 90) {
-      char const* env = std::getenv("TRTLLM_ENABLE_PDL");
+      char const* env = std::getenv("VLLM_ENABLE_PDL");
       enablePDL = env && env[0] == '1' && env[1] == '\0';
     }
   });
@@ -326,7 +326,7 @@ struct GmemLoaderB {
 
   __device__ void issue_mainloop() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    asm volatile("griddepcontrol.wait;");
+    cudaGridDependencySynchronize();
   #pragma unroll 1
     for (int loop_idx = 0; loop_idx < k_iter_cnt; loop_idx++) {
       if (need_wait) {
@@ -623,6 +623,8 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
     }
   }
   __syncthreads();
+  cudaGridDependencySynchronize();
+  cudaTriggerProgrammaticLaunchCompletion();
 
   if (warp_idx < 2) {
     GmemLoaderA<gemm_k, tile_m, tile_k, stage_cnt> a_loader(
@@ -641,7 +643,6 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
     mma_computer.issue_mainloop();
     mma_computer.epi();
   }
-  asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 
@@ -649,7 +650,7 @@ template <typename T, int kHdIn, int kHdOut, int kTileN>
 void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
                       cudaStream_t const stream) {
   constexpr int gemm_m = kHdOut;  // 2112
-  int const gemm_n = num_tokens;  // 1-16
+  int const gemm_n = num_tokens;  // 1-32
   constexpr int gemm_k = kHdIn;   // 7168
   constexpr int batch_size = 1;
   std::swap(mat_a, mat_b);
@@ -709,8 +710,8 @@ void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a,
 
   constexpr int kHdIn = 7168;
   constexpr int kHdOut = 2112;
-  TORCH_CHECK(num_tokens >= 1 && num_tokens <= 16,
-              "required 1 <= mat_a.shape[0] <= 16")
+  TORCH_CHECK(num_tokens >= 1 && num_tokens <= 32,
+              "required 1 <= mat_a.shape[0] <= 32")
   TORCH_CHECK(hd_in == kHdIn, "required mat_a.shape[1] == 7168")
   TORCH_CHECK(hd_out == kHdOut, "required mat_b.shape[1] == 2112")
   TORCH_CHECK(output.size(0) == num_tokens,

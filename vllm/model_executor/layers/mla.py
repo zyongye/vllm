@@ -4,11 +4,15 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm.config import CacheConfig
+from vllm.config import CacheConfig, get_current_vllm_config
+from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+from vllm.utils.torch_utils import (
+    direct_register_custom_op,
+)
 
 
 @dataclass
@@ -115,6 +119,28 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         self.prefix = prefix
 
+        # Register self so mla_qkv_norm custom op can look up this layer
+        # via forward_context.no_compile_layers[layer_name].
+        vllm_config = get_current_vllm_config()
+        compilation_config = vllm_config.compilation_config
+        if prefix not in compilation_config.static_forward_context:
+            compilation_config.static_forward_context[prefix] = self
+
+    def _qkv_norm(
+        self,
+        q_c: torch.Tensor,
+        kv_c: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.q_a_layernorm is not None
+
+        return maybe_execute_in_parallel(
+            lambda: self.q_a_layernorm(q_c),
+            lambda: self.kv_a_layernorm(kv_c),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -140,13 +166,18 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
                 dim=-1,
             )
-            q_c, kv_c_normed = maybe_execute_in_parallel(
-                lambda: self.q_a_layernorm(q_c),
-                lambda: self.kv_a_layernorm(kv_c),
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
+            q_c, kv_c_normed = torch.ops.vllm.mla_qkv_norm(
+                q_c,
+                kv_c,
+                self.prefix,
             )
+            # q_c, kv_c_normed = maybe_execute_in_parallel(
+            #     lambda: self.q_a_layernorm(q_c),
+            #     lambda: self.kv_a_layernorm(kv_c),
+            #     self.ln_events[0],
+            #     self.ln_events[1],
+            #     self.aux_stream,
+            # )
             q = self.q_b_proj(q_c)[0]
         else:
             assert self.kv_a_proj_with_mqa is not None, (
@@ -187,3 +218,33 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         return self.o_proj(attn_out)[0]
+
+
+def mla_qkv_norm(
+    q_c: torch.Tensor,
+    kv_c: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fake implementation for torch.compile."""
+    forward_context: ForwardContext = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+
+    return self._qkv_norm(q_c, kv_c)
+
+
+def mla_qkv_norm_fake(
+    q_c: torch.Tensor,
+    kv_c: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fake implementation for torch.compile."""
+    # Layernorm always produces a contiguous output; return fresh contiguous
+    # tensors so inductor infers the correct output strides.
+    return q_c.new_empty(q_c.shape), kv_c.new_empty(kv_c.shape)
+
+
+direct_register_custom_op(
+    op_name="mla_qkv_norm",
+    op_func=mla_qkv_norm,
+    fake_impl=mla_qkv_norm_fake,
+)
