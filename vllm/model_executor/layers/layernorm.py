@@ -260,6 +260,16 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        add_residual = residual is not None
+        if add_residual:
+            torch.ops.vllm.flashinfer_fused_add_rmsnorm(
+                x, residual, self.weight.data, self.variance_epsilon
+            )
+            return x, residual
+        else:
+            return torch.ops.vllm.flashinfer_rmsnorm(
+                x, self.weight.data, self.variance_epsilon
+            )
         if residual is None and not envs.VLLM_BATCH_INVARIANT:
             return ir.ops.rms_norm(
                 x, self.weight.data, self.variance_epsilon, self.variance_size_override
