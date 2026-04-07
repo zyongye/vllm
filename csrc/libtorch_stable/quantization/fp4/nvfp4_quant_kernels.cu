@@ -89,11 +89,23 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
   //  ensures we visit every single scale factor address to initialize it.
   for (int rowIdx = blockIdx.x; rowIdx < sf_m; rowIdx += gridDim.x) {
     if (colIdx < num_padded_cols) {
+      // Row-padding: skip quantization compute and write zero to scale.
+      // rowIdx is uniform across the warp (derived from blockIdx.x), so this
+      // branch is divergence-free.
+      if (rowIdx >= numRows) {
+        uint8_t* sf_out =
+            cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+                                               CVT_FP4_NUM_THREADS_PER_SF>(
+                rowIdx, colIdx, numKTiles, SFout);
+        if (sf_out) *sf_out = 0;
+        continue;
+      }
+
       PackedVec in_vec;
       int64_t inOffset = rowIdx * (numCols / CVT_FP4_ELTS_PER_THREAD) + colIdx;
 
-      // If we are outside valid rows OR outside valid columns -> Use Zeros
-      bool valid = (rowIdx < numRows) && (elem_idx < numCols);
+      // If we are outside valid columns -> Use Zeros
+      bool valid = (elem_idx < numCols);
       if constexpr (CVT_FP4_PACK16) {
         ld256_cg_or_zero(reinterpret_cast<u32x8_t&>(in_vec),
                          &reinterpret_cast<const uint32_t*>(in)[inOffset * 8],
@@ -284,12 +296,11 @@ void scaled_fp4_quant_sm1xxa(torch::stable::Tensor const& output,
           using cuda_type = vllm::CUDATypeConverter<scalar_t>::Type;
           auto input_ptr = static_cast<cuda_type const*>(input.data_ptr());
           // NOTE: We don't support e8m0 scales at this moment.
-          cudaLaunchKernelEx(&config,
-                             vllm::cvt_fp16_to_fp4_sf_major<cuda_type, false>,
-                             m, n, sf_n_unpadded, num_packed_cols, input_ptr,
-                             input_sf_ptr,
-                             reinterpret_cast<uint32_t*>(output_ptr),
-                             reinterpret_cast<uint32_t*>(sf_out));
+          cudaLaunchKernelEx(
+              &config, vllm::cvt_fp16_to_fp4_sf_major<cuda_type, false>, m, n,
+              sf_n_unpadded, num_packed_cols, input_ptr, input_sf_ptr,
+              reinterpret_cast<uint32_t*>(output_ptr),
+              reinterpret_cast<uint32_t*>(sf_out));
         });
   }
 }

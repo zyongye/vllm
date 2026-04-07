@@ -56,7 +56,11 @@ def create_fp4_scale_tensor(
         rounded_m = round_up(m, 128)
         scale_n = n // block_size
         rounded_n = round_up(scale_n, 4)
-        return torch.zeros(
+        # torch.empty is safe: the quant kernel explicitly zeroes all padding
+        # entries (row-padding via early-exit branch, col-padding via
+        # ld128_cg_or_zero producing zero scale values), so no separate
+        # cudaMemset is needed.
+        return torch.empty(
             (rounded_m, rounded_n // 4), device=device, dtype=torch.int32
         )
     else:
@@ -2749,7 +2753,9 @@ def mla_fp8_quantize_qkv(
     q_out = torch.empty_like(q, dtype=torch.float8_e4m3fn)
     k_out = torch.empty_like(k, dtype=torch.float8_e4m3fn)
     v_out = torch.empty(
-        v.shape[0], v.shape[1], v.shape[2],
+        v.shape[0],
+        v.shape[1],
+        v.shape[2],
         dtype=torch.float8_e4m3fn,
         device=v.device,
     )
