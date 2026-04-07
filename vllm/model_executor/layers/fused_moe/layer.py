@@ -275,6 +275,7 @@ class FusedMoE(CustomOp):
         gate: torch.nn.Module | None = None,
         shared_experts: torch.nn.Module | None = None,
         routed_input_transform: torch.nn.Module | None = None,
+        aux_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
 
@@ -582,6 +583,7 @@ class FusedMoE(CustomOp):
             quant_method=self.quant_method,
             reduce_results=self.reduce_results,
             enable_dbo=self.vllm_config.parallel_config.enable_dbo,
+            aux_stream=aux_stream,
         )
 
     # TODO(bnell): This method is provided as a hook so vllm/lora/layers/fused_moe.py

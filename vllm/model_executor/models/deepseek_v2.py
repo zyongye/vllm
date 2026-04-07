@@ -240,6 +240,7 @@ class DeepseekV2MoE(nn.Module):
         parallel_config: ParallelConfig,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        aux_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -333,6 +334,7 @@ class DeepseekV2MoE(nn.Module):
             n_shared_experts=config.n_shared_experts
             if self.is_fusion_moe_shared_experts_enabled
             else None,
+            aux_stream=aux_stream,
         )
 
         # NOTE(rob): this is a hack until we finish off the PR for
@@ -1080,6 +1082,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 parallel_config=parallel_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                aux_stream=aux_stream_dict[AuxStreamType.MoeShared],
             )
         else:
             self.mlp = DeepseekV2MLP(

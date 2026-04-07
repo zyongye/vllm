@@ -17,6 +17,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.platforms import current_platform
+from vllm.utils.multi_stream_utils import EventType
 from vllm.utils.torch_utils import (
     aux_stream,
     current_stream,
@@ -55,6 +56,7 @@ class SharedExperts:
         quant_method: QuantizeMethodBase,
         reduce_results: bool,
         enable_dbo: bool,
+        _aux_stream: torch.cuda.Stream | None,
     ):
         from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
             FusedMoEMethodBase,
@@ -75,6 +77,9 @@ class SharedExperts:
         self._quant_method = quant_method
         self._reduce_results = reduce_results
         self._use_dp_chunking = moe_config.moe_parallel_config.use_dp_chunking
+        self.event_dict = {
+            key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]
+        }
 
         # Allow disabling of the separate shared experts stream for
         # debug purposes.

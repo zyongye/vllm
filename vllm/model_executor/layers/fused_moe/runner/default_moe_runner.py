@@ -186,6 +186,7 @@ class DefaultMoERunner(MoERunner):
         quant_method: FusedMoEMethodBase,
         reduce_results: bool,
         enable_dbo: bool,
+        aux_stream: torch.cuda.Stream | None,
     ):
         super().__init__()
         self.moe_config = moe_config
@@ -209,6 +210,7 @@ class DefaultMoERunner(MoERunner):
                 reduce_results=reduce_results,
                 quant_method=quant_method,
                 enable_dbo=enable_dbo,
+                _aux_stream=aux_stream,
             )
 
         # Chunked all2all staging tensor
