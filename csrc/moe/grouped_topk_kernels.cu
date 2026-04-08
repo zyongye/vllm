@@ -1008,8 +1008,7 @@ INSTANTIATE_NOAUX_TC(__nv_bfloat16, __nv_bfloat16, int32_t, SCORING_NONE);
 std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
     torch::Tensor const& scores, int64_t n_group, int64_t topk_group,
     int64_t topk, bool renormalize, double routed_scaling_factor,
-    torch::Tensor const& bias, int64_t scoring_func = 0,
-    bool enable_pdl = false) {
+    torch::Tensor const& bias, int64_t scoring_func = 0) {
   auto data_type = scores.scalar_type();
   auto bias_type = bias.scalar_type();
   auto input_size = scores.sizes();
@@ -1039,6 +1038,13 @@ std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
 
   auto stream = c10::cuda::getCurrentCUDAStream(scores.get_device());
   auto const sf = static_cast<vllm::moe::ScoringFunc>(scoring_func);
+
+  // Auto-enable PDL on SM90+: cudaDeviceGetAttribute reads cached HW data,
+  // so this is essentially free.
+  int sm_major = 0;
+  cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor,
+                         static_cast<int>(scores.get_device()));
+  bool const enable_pdl = (sm_major >= 9);
 
 #define LAUNCH_KERNEL_SF(T, BiasT, IdxT)                                      \
   do {                                                                        \

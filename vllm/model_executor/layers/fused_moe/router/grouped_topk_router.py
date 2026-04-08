@@ -36,16 +36,8 @@ def fused_grouped_topk(
     topk_group: int = 0,
     scoring_func: str = "softmax",
     routed_scaling_factor: float = 1.0,
-    enable_pdl: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"
-
-    # Auto-enable PDL on SM90+ / SM100+ if not explicitly specified.
-    if enable_pdl is None:
-        enable_pdl = current_platform.is_cuda() and (
-            current_platform.is_device_capability(90)
-            or current_platform.is_device_capability_family(100)
-        )
 
     if scoring_func == "sigmoid":
         # Fully fused kernel path for sigmoid
@@ -58,7 +50,6 @@ def fused_grouped_topk(
             routed_scaling_factor,
             e_score_correction_bias,
             1,  # scoring_func=1 for sigmoid
-            enable_pdl,
         )
     elif scoring_func == "softmax":
         # Apply softmax in Python, then use fused kernel
@@ -73,7 +64,6 @@ def fused_grouped_topk(
             routed_scaling_factor,
             e_score_correction_bias,
             0,  # scoring_func=0 (no activation, scores already computed)
-            enable_pdl,
         )
     else:
         raise ValueError(f"Unsupported scoring function: {scoring_func}")
