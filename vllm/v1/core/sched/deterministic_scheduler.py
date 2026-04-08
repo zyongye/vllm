@@ -109,9 +109,19 @@ class DeterministicMixin:
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_computed
 
+                # Only the un-cached portion needs new KV slots.
+                # _update_after_schedule will then do:
+                #   num_computed_tokens += num_new_tokens
+                # giving num_computed_tokens = num_computed + num_new_tokens
+                # = the full prompt length, which is correct.
+                # Passing num_tokens here instead of num_new_tokens would
+                # double-count the prefix-cached tokens and produce
+                # num_computed_tokens > prompt_len, causing the normal
+                # scheduler to schedule negative tokens on the next step.
+                num_new_tokens = num_tokens - num_computed
                 new_blocks = self.kv_cache_manager.allocate_slots(  # type: ignore[attr-defined]
                     request,
-                    num_tokens,
+                    num_new_tokens,
                     num_new_computed_tokens=num_computed,
                     new_computed_blocks=computed_blocks,
                 )
@@ -135,6 +145,11 @@ class DeterministicMixin:
                         request, new_blocks.get_block_ids(), prefill_ids
                     )
                 )
+                # Use the actual new-token count so _update_after_schedule
+                # produces the correct num_computed_tokens.
+                num_scheduled_tokens[req_id] = num_new_tokens
+                req_to_new_blocks[req_id] = new_blocks
+                continue
 
             elif request.status == RequestStatus.RUNNING:
                 new_blocks = self.kv_cache_manager.allocate_slots(  # type: ignore[attr-defined]
