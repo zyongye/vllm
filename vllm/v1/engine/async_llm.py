@@ -774,6 +774,102 @@ class AsyncLLM(EngineClient):
         """Return whether the engine is currently paused."""
         return await self.engine_core.is_scheduler_paused_async()
 
+    # ------------------------------------------------------------------
+    # Benchmark API
+    # ------------------------------------------------------------------
+
+    async def add_benchmark_requests(self, requests: list[dict]) -> list[str]:
+        """Add requests from raw token IDs, bypassing the text tokenizer.
+
+        Each entry in *requests* must have:
+            prompt_token_ids (list[int]): exact token sequence to prefill.
+            max_tokens (int): maximum decode tokens after prefill.
+            dp_rank (int, optional): DP rank to route to (default: None).
+
+        Returns the internal request_id for each added request, in the same
+        order as *requests*. Use these IDs in POST /v1/benchmark/step.
+
+        Outputs are buffered in a FINAL_ONLY collector and not consumed —
+        this is intentional for pure timing benchmarks. If you also need
+        the generated tokens, use the normal /v1/completions API instead.
+        """
+        import time as _time
+        import uuid as _uuid
+
+        from vllm.sampling_params import RequestOutputKind, SamplingParams
+        from vllm.v1.engine.output_processor import RequestOutputCollector
+
+        # Pause engine (PAUSED_ALL / "keep" mode) BEFORE adding requests so
+        # the busy loop cannot auto-schedule them.  The engine will stay paused
+        # until POST /resume or the next run_benchmark_step temporarily unpauses.
+        await self.engine_core.pause_scheduler_async(mode="keep", clear_cache=False)
+
+        self._run_output_handler()
+        supported_tasks = await self.get_supported_tasks()
+        request_ids: list[str] = []
+
+        for req in requests:
+            req_id = str(_uuid.uuid4())
+            params = SamplingParams(
+                max_tokens=req["max_tokens"],
+                output_kind=RequestOutputKind.FINAL_ONLY,
+            )
+            engine_req = self.input_processor.process_inputs(
+                req_id,
+                {"prompt_token_ids": req["prompt_token_ids"]},
+                params,
+                supported_tasks=supported_tasks,
+                arrival_time=_time.time(),
+                data_parallel_rank=req.get("dp_rank"),
+            )
+            self.input_processor.assign_request_id(engine_req)
+            queue = RequestOutputCollector(
+                RequestOutputKind.FINAL_ONLY, engine_req.request_id
+            )
+            await self._add_request(engine_req, None, None, 0, queue)
+            request_ids.append(engine_req.request_id)
+
+        return request_ids
+
+    async def run_benchmark_step(
+        self, per_rank_specs: dict[int, dict[str, int]]
+    ) -> dict[str, dict]:
+        """Run one deterministic forward pass per DP rank simultaneously.
+
+        Args:
+            per_rank_specs: mapping of rank_index -> {req_id: num_tokens}.
+                Use {0: spec} for single-engine or non-DP setups.
+
+        Returns:
+            {str(rank): {"duration_ns": int, "num_tokens": int,
+                          "executed": bool}}
+
+        After each call the engine stays paused (PAUSED_ALL). Use
+        POST /resume (or engine.resume_generation()) to return to normal.
+        """
+        import json as _json
+
+        client = self.engine_core
+
+        async def _call_rank(rank: int, spec: dict[str, int]):
+            spec_json = _json.dumps(spec)
+            # core_engines is a list of 2-byte ZMQ identities (one per DP
+            # rank). For non-DP setups the list has a single entry at [0].
+            if hasattr(client, "core_engines"):
+                engine = client.core_engines[rank]
+            else:
+                engine = client.core_engine
+            return await client._call_utility_async(
+                "run_benchmark_step", spec_json, engine=engine
+            )
+
+        results = await asyncio.gather(
+            *[_call_rank(rank, spec) for rank, spec in per_rank_specs.items()]
+        )
+        return {
+            str(rank): result for rank, result in zip(per_rank_specs.keys(), results)
+        }
+
     async def encode(
         self,
         prompt: PromptType | EngineInput,

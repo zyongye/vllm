@@ -125,7 +125,13 @@ class EngineCore:
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.
-        Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
+        from vllm.v1.core.sched.deterministic_scheduler import (
+            wrap_with_deterministic,
+        )
+
+        Scheduler = wrap_with_deterministic(
+            vllm_config.scheduler_config.get_scheduler_cls()
+        )
 
         if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
             # Encoder models without KV cache don't support
@@ -597,6 +603,100 @@ class EngineCore:
         self.scheduler.reset_encoder_cache()
         # Reset the GPU model runner's encoder cache (physical storage)
         self.model_executor.reset_encoder_cache()
+
+    def run_benchmark_step(self, spec_json: str) -> dict:
+        """Run exactly one deterministic forward pass. Called via UTILITY.
+
+        This method is invoked from the HTTP benchmark endpoint via the
+        existing UTILITY call mechanism. It runs inside _process_input_queue()
+        — the busy loop is blocked waiting for the utility to return — so
+        calling self.step() here is safe (no double-step race).
+
+        After the step, the scheduler is set to PAUSED_ALL so the busy loop
+        does not auto-schedule again. Use POST /resume to return to normal.
+
+        Args:
+            spec_json: JSON string mapping req_id -> num_tokens, e.g.
+                       '{"req-abc": 512, "req-def": 128}'
+        Returns:
+            dict with keys: duration_ns (int), num_tokens (int), executed (bool)
+        """
+        import json
+
+        from vllm.v1.outputs import AsyncModelRunnerOutput
+
+        # Use hasattr (not isinstance) so the type-checker does not narrow
+        # self.scheduler away from SchedulerInterface, which would hide
+        # set_pause_state / has_requests / etc.
+        if not hasattr(self.scheduler, "set_batch_spec"):
+            raise RuntimeError(
+                "run_benchmark_step requires DeterministicMixin in scheduler MRO. "
+                "This should be automatic — check EngineCore.__init__."
+            )
+
+        spec: dict[str, int] = json.loads(spec_json)
+        self.scheduler.set_batch_spec(spec)  # type: ignore[attr-defined]
+
+        # Temporarily UNSET pause so has_requests() and schedule() work.
+        # Re-pause immediately after the step so the busy loop cannot
+        # auto-schedule between now and the next UTILITY call.
+        self.scheduler.set_pause_state(PauseState.UNPAUSED)
+
+        if not self.scheduler.has_requests():
+            self.scheduler.set_pause_state(PauseState.PAUSED_ALL)
+            return {"duration_ns": 0, "num_tokens": 0, "executed": False}
+
+        scheduler_output = self.scheduler.schedule()
+        executed = scheduler_output.total_num_scheduled_tokens > 0
+
+        t0 = time.monotonic_ns()
+
+        # Run the forward pass. execute_model returns None for async scheduling
+        # (the model runner stores state for sample_tokens to consume).
+        exec_future = self.model_executor.execute_model(
+            scheduler_output, non_block=True
+        )
+        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+
+        exec_result = exec_future.result()
+
+        if exec_result is None:
+            # Async scheduling: sampling is deferred to sample_tokens().
+            # Use non_block=True so the executor wraps AsyncModelRunnerOutput
+            # in a thread that calls get_output(), avoiding a raw async object.
+            sample_future = self.model_executor.sample_tokens(
+                grammar_output, non_block=True
+            )
+            model_output = sample_future.result()
+        else:
+            model_output = exec_result
+
+        # Unwrap async output if it wasn't handled by the thread pool.
+        if isinstance(model_output, AsyncModelRunnerOutput):
+            model_output = model_output.get_output()
+
+        t1 = time.monotonic_ns()
+
+        self._process_aborts_queue()
+        outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+
+        # Re-pause so the busy loop doesn't auto-schedule after we return.
+        self.scheduler.set_pause_state(PauseState.PAUSED_ALL)
+
+        # Forward outputs through the normal output queue so any generate()
+        # waiters receive them.  output_queue is defined on EngineCoreProc
+        # (the subprocess variant), which is the only context where this
+        # method is called via the UTILITY mechanism.
+        if outputs:
+            for item in outputs.items():
+                self.output_queue.put_nowait(item)  # type: ignore[attr-defined]
+
+        num_tokens = sum(spec.values()) if executed else 0
+        return {
+            "duration_ns": t1 - t0,
+            "num_tokens": num_tokens,
+            "executed": executed,
+        }
 
     def _reset_caches(self, reset_running_requests=True) -> None:
         self.reset_prefix_cache(reset_running_requests=reset_running_requests)

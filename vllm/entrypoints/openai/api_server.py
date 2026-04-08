@@ -220,6 +220,10 @@ def build_app(
 
         elastic_ep_attach_router(app)
 
+    from vllm.entrypoints.serve.benchmark.api_router import router as benchmark_router
+
+    app.include_router(benchmark_router)
+
     if "generate" in supported_tasks or "render" in supported_tasks:
         from vllm.entrypoints.serve.render.api_router import (
             attach_router as attach_render_router,
