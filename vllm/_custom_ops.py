@@ -2378,6 +2378,7 @@ def grouped_topk(
     routed_scaling_factor: float,
     bias: torch.Tensor,
     scoring_func: int = 0,
+    enable_pdl: bool = False,
 ):
     """
     Perform grouped top-k routing for mixture of experts.
@@ -2391,6 +2392,7 @@ def grouped_topk(
         routed_scaling_factor: Scaling factor for routing weights
         bias: Bias tensor (e_score_correction_bias). Always fused in kernel.
         scoring_func: 0=none (no activation), 1=sigmoid
+        enable_pdl: Enable Programmatic Dependent Launch (PDL) for SM90+.
     """
     if not current_platform.is_cuda():
         raise NotImplementedError(
@@ -2405,6 +2407,7 @@ def grouped_topk(
         routed_scaling_factor,
         bias,
         scoring_func,
+        enable_pdl,
     )
 
 

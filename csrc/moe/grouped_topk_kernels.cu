@@ -678,9 +678,6 @@ __global__ void grouped_topk_fused_small_expert_count_kernel(
     int64_t const topk, int64_t const numExperts,
     int64_t const numExpertsPerGroup, bool const renormalize,
     double const routedScalingFactor) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  cudaGridDependencySynchronize();
-#endif
   // declare shared memory structure
   // number of experts is bounded by number of threads
   __shared__ float __attribute((aligned(128))) smemScoreSigmoid[MaxNumExperts];
@@ -716,10 +713,17 @@ __global__ void grouped_topk_fused_small_expert_count_kernel(
   }
 
   auto scoreIdx = int64_t{blockIdx.x} * int64_t{numExperts} + threadExpert;
+  // bias is a constant input (not predecessor output) — load before the wait
   auto biasVal = expertSelected ? static_cast<float>(routingBias[threadExpert])
                                 : invalidScoreFloat;
   topkValues += blockIdx.x * topk;
   topkIndices += blockIdx.x * topk;
+
+  // Wait for predecessor grid (scores tensor) only here, after all ptr
+  // arithmetic and constant loads, so we overlap as much work as possible.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
 
   // get our assigned thread score; each warp represents one expert group
   float score =
@@ -1004,7 +1008,8 @@ INSTANTIATE_NOAUX_TC(__nv_bfloat16, __nv_bfloat16, int32_t, SCORING_NONE);
 std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
     torch::Tensor const& scores, int64_t n_group, int64_t topk_group,
     int64_t topk, bool renormalize, double routed_scaling_factor,
-    torch::Tensor const& bias, int64_t scoring_func = 0) {
+    torch::Tensor const& bias, int64_t scoring_func = 0,
+    bool enable_pdl = false) {
   auto data_type = scores.scalar_type();
   auto bias_type = bias.scalar_type();
   auto input_size = scores.sizes();
@@ -1045,7 +1050,7 @@ std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
             reinterpret_cast<IdxT*>(topk_indices.mutable_data_ptr()),         \
             reinterpret_cast<BiasT const*>(bias.data_ptr()), num_tokens,      \
             num_experts, n_group, topk_group, topk, renormalize,              \
-            routed_scaling_factor, false, stream);                            \
+            routed_scaling_factor, enable_pdl, stream);                       \
         break;                                                                \
       case vllm::moe::SCORING_SIGMOID:                                        \
         vllm::moe::invokeNoAuxTc<T, BiasT, IdxT, vllm::moe::SCORING_SIGMOID>( \
@@ -1054,7 +1059,7 @@ std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
             reinterpret_cast<IdxT*>(topk_indices.mutable_data_ptr()),         \
             reinterpret_cast<BiasT const*>(bias.data_ptr()), num_tokens,      \
             num_experts, n_group, topk_group, topk, renormalize,              \
-            routed_scaling_factor, false, stream);                            \
+            routed_scaling_factor, enable_pdl, stream);                       \
         break;                                                                \
       default:                                                                \
         throw std::invalid_argument("Unsupported scoring_func");              \
