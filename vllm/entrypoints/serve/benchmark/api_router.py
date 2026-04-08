@@ -60,6 +60,10 @@ async def benchmark_step(raw_request: Request):
     Multi-rank DP body (all ranks execute in parallel):
         {"ranks": {"0": {"<req_id>": <num_tokens>}, "1": {...}, ...}}
 
+    Optional profiling fields (require --profiler-config at server startup):
+        "profile": true          -- wrap the forward pass with the GPU profiler
+        "profile_prefix": "str"  -- trace-file name prefix (default: none)
+
     Response (always keyed by rank string):
         {
             "0": {"duration_ns": int, "num_tokens": int, "executed": bool},
@@ -75,8 +79,13 @@ async def benchmark_step(raw_request: Request):
     else:
         per_rank_specs = {int(k): v for k, v in body["ranks"].items()}
 
+    profile: bool = body.get("profile", False)
+    profile_prefix: str | None = body.get("profile_prefix", None)
+
     engine = _engine(raw_request)
-    result = await engine.run_benchmark_step(per_rank_specs)
+    result = await engine.run_benchmark_step(
+        per_rank_specs, profile=profile, profile_prefix=profile_prefix
+    )
     return JSONResponse(result)
 
 

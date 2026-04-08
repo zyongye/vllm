@@ -832,13 +832,20 @@ class AsyncLLM(EngineClient):
         return request_ids
 
     async def run_benchmark_step(
-        self, per_rank_specs: dict[int, dict[str, int]]
+        self,
+        per_rank_specs: dict[int, dict[str, int]],
+        profile: bool = False,
+        profile_prefix: str | None = None,
     ) -> dict[str, dict]:
         """Run one deterministic forward pass per DP rank simultaneously.
 
         Args:
             per_rank_specs: mapping of rank_index -> {req_id: num_tokens}.
                 Use {0: spec} for single-engine or non-DP setups.
+            profile: If True, wrap the GPU forward pass with the profiler
+                configured at server startup (``--profiler-config``).
+            profile_prefix: Optional trace-name prefix passed to the worker
+                profiler (e.g. ``"prefill"``).
 
         Returns:
             {str(rank): {"duration_ns": int, "num_tokens": int,
@@ -860,7 +867,11 @@ class AsyncLLM(EngineClient):
             else:
                 engine = client.core_engine
             return await client._call_utility_async(
-                "run_benchmark_step", spec_json, engine=engine
+                "run_benchmark_step",
+                spec_json,
+                profile,
+                profile_prefix,
+                engine=engine,
             )
 
         results = await asyncio.gather(

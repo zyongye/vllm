@@ -604,7 +604,12 @@ class EngineCore:
         # Reset the GPU model runner's encoder cache (physical storage)
         self.model_executor.reset_encoder_cache()
 
-    def run_benchmark_step(self, spec_json: str) -> dict:
+    def run_benchmark_step(
+        self,
+        spec_json: str,
+        profile: bool = False,
+        profile_prefix: str | None = None,
+    ) -> dict:
         """Run exactly one deterministic forward pass. Called via UTILITY.
 
         This method is invoked from the HTTP benchmark endpoint via the
@@ -618,6 +623,12 @@ class EngineCore:
         Args:
             spec_json: JSON string mapping req_id -> num_tokens, e.g.
                        '{"req-abc": 512, "req-def": 128}'
+            profile: If True, wrap the forward pass with the GPU profiler
+                (torch or nsys).  Requires ``--profiler-config`` at server
+                startup; raises RuntimeError otherwise.
+            profile_prefix: Optional trace-name prefix forwarded to the GPU
+                worker's profiler (e.g. ``"prefill"`` → file name
+                ``"prefill_rank0_tp0_..."``)
         Returns:
             dict with keys: duration_ns (int), num_tokens (int), executed (bool)
         """
@@ -649,6 +660,9 @@ class EngineCore:
         scheduler_output = self.scheduler.schedule()
         executed = scheduler_output.total_num_scheduled_tokens > 0
 
+        if profile:
+            self.model_executor.profile(True, profile_prefix)
+
         t0 = time.monotonic_ns()
 
         # Run the forward pass. execute_model returns None for async scheduling
@@ -676,6 +690,9 @@ class EngineCore:
             model_output = model_output.get_output()
 
         t1 = time.monotonic_ns()
+
+        if profile:
+            self.model_executor.profile(False)
 
         self._process_aborts_queue()
         outputs = self.scheduler.update_from_output(scheduler_output, model_output)
