@@ -35,7 +35,7 @@ inline bool getEnvEnablePDL() {
   static bool enablePDL = false;
   std::call_once(flag, [&]() {
     if (getSMVersion() >= 90) {
-      const char* env = std::getenv("TRTLLM_ENABLE_PDL");
+      const char* env = std::getenv("VLLM_ENABLE_PDL");
       enablePDL = env && env[0] == '1' && env[1] == '\0';
     }
   });
