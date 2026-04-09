@@ -570,7 +570,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "fuse_mla_decode_rope_q_concat_kv_insert("
       "    Tensor positions,"
       "    Tensor q_nope,"
-      "    Tensor! q_pe,"
+      "    Tensor q_pe,"
       "    Tensor kv,"
       "    Tensor cos_sin_cache,"
       "    bool rope_is_neox,"

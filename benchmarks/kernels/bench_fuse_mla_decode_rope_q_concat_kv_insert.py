@@ -15,9 +15,9 @@ Usage:
 import argparse
 
 import torch
-from vllm.triton_utils import triton
 
 from vllm import _custom_ops as ops
+from vllm.triton_utils import triton
 
 # DeepSeekV3 / TP=1 defaults
 KV_LORA_RANK = 512
@@ -113,7 +113,7 @@ def bench_bf16(num_tokens: int, provider: str):
 
     if provider == "unfused":
 
-        def fn():
+        def fn(d=d):
             ops.concat_and_cache_mla_rope_fused(
                 d["positions"],
                 d["q_pe"],
@@ -129,7 +129,7 @@ def bench_bf16(num_tokens: int, provider: str):
             ops.concat_mla_q(d["q_nope"], d["q_pe"], d["q_out_ref"])
     else:
 
-        def fn():
+        def fn(d=d):
             ops.fuse_mla_decode_rope_q_concat_kv_insert(
                 d["positions"],
                 d["q_nope"],
@@ -170,7 +170,7 @@ def run_bw_table(dtype: torch.dtype) -> None:
     for B in NUM_TOKENS:
         d = make_inputs(B, NUM_HEADS, dtype)
 
-        def fn():
+        def fn(d=d):
             ops.fuse_mla_decode_rope_q_concat_kv_insert(
                 d["positions"],
                 d["q_nope"],

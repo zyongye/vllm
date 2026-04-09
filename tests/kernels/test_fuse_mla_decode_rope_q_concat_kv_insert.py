@@ -164,7 +164,7 @@ def test_fuse_mla_decode_rope_q_concat_kv_insert(
     ops.fuse_mla_decode_rope_q_concat_kv_insert(
         positions,
         q_nope,
-        q_pe.clone(),  # kernel modifies q_pe in-place; clone to keep ref clean
+        q_pe.clone(),  # q_pe is now read-only; clone kept for safety
         kv.clone(),
         cos_sin_cache,
         is_neox,

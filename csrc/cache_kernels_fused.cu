@@ -286,6 +286,9 @@ void concat_and_cache_mla_rope_fused(
 
 namespace vllm {
 
+// q_pe is read-only: the in-place update is removed since the rotated values
+// are only consumed via q_out and not needed afterward (saves 2
+// stores/element).
 template <typename qk_t, bool IS_NEOX, typename raw_kv_scalar_t,
           typename cache_t, Fp8KVCacheDataType kv_dt, bool DO_FP8_Q,
           int STATIC_KV_LORA_RANK = 0, int STATIC_ROT_DIM = 0,
@@ -293,10 +296,11 @@ template <typename qk_t, bool IS_NEOX, typename raw_kv_scalar_t,
 __global__ void fuse_mla_decode_rope_q_concat_kv_insert_kernel(
     const int64_t* __restrict__ positions,  // [num_tokens]
     const qk_t* __restrict__ q_nope,  // [num_tokens, num_q_heads, kv_lora_rank]
-    qk_t* __restrict__ q_pe,  // [num_tokens, num_q_heads, rot_dim] (in-place)
-    const qk_t* __restrict__ kv,  // [num_tokens, kv_lora_rank + rot_dim]
-    const cos_sin_t* __restrict__ cos_sin_cache,  // [max_position, rot_dim]
-    const int rot_dim, const int kv_lora_rank, const int num_q_heads,
+    const qk_t* __restrict__ q_pe,    // [num_tokens, num_q_heads, rot_dim]
+                                      // (read-only)
+    const qk_t* __restrict__ kv,      // [num_tokens, kv_lora_rank + rot_dim]
+    const cos_sin_t* __restrict__ cos_sin_cache, const int rot_dim,
+    const int kv_lora_rank, const int num_q_heads,
     const int64_t q_nope_stride_t, const int64_t q_nope_stride_h,
     const int64_t q_pe_stride_t, const int64_t q_pe_stride_h,
     const int64_t kv_stride_t, cache_t* __restrict__ kv_cache,
@@ -311,10 +315,12 @@ __global__ void fuse_mla_decode_rope_q_concat_kv_insert_kernel(
   const int64_t token_idx = blockIdx.x;
   const int part_idx = blockIdx.y;
   const int64_t pos = positions[token_idx];
+
   constexpr bool kFixedShape = (STATIC_KV_LORA_RANK > 0 && STATIC_ROT_DIM > 0);
   const int rot_dim_val = kFixedShape ? STATIC_ROT_DIM : rot_dim;
   const int kv_lora_rank_val = kFixedShape ? STATIC_KV_LORA_RANK : kv_lora_rank;
   const int embed_dim = rot_dim_val / 2;
+
   using copy_vec_t = int4;
   constexpr int qk_vec_elts = sizeof(copy_vec_t) / sizeof(qk_t);
   constexpr int cache_vec_elts = sizeof(copy_vec_t) / sizeof(cache_t);
@@ -338,17 +344,18 @@ __global__ void fuse_mla_decode_rope_q_concat_kv_insert_kernel(
   //   (num_q_heads, grid.y) : tiled blocks for kv_c cache insertion
   if (part_idx < num_q_heads) {
     const int head = part_idx;
-    qk_t* q_pe_head =
+    const qk_t* q_pe_head =
         q_pe + token_idx * q_pe_stride_t + (int64_t)head * q_pe_stride_h;
     const int64_t q_out_base =
         token_idx * q_out_stride_t + (int64_t)head * q_out_stride_h;
 
-    // ---- Phase A: RoPE on q_pe + write rotated values into q_out[.., L:] ----
+    // ---- Phase A: RoPE q_pe → q_out[.., L:] (q_pe read-only, no writeback)
+    // ----
     for (int pair_idx = threadIdx.x; pair_idx < embed_dim;
          pair_idx += blockDim.x) {
-      // Always do RoPE arithmetic in float to support float32 cos_sin_cache.
-      const float cos = static_cast<float>(VLLM_LDG(cos_sin_ptr + pair_idx));
-      const float sin =
+      // Always do RoPE arithmetic in float32 to support float32 cos_sin_cache.
+      const float cos_v = static_cast<float>(VLLM_LDG(cos_sin_ptr + pair_idx));
+      const float sin_v =
           static_cast<float>(VLLM_LDG(cos_sin_ptr + pair_idx + embed_dim));
 
       int x_idx, y_idx;
@@ -362,17 +369,15 @@ __global__ void fuse_mla_decode_rope_q_concat_kv_insert_kernel(
 
       const float x = static_cast<float>(q_pe_head[x_idx]);
       const float y = static_cast<float>(q_pe_head[y_idx]);
-      const float xr = x * cos - y * sin;
-      const float yr = y * cos + x * sin;
-
-      q_pe_head[x_idx] = static_cast<qk_t>(xr);  // in-place
-      q_pe_head[y_idx] = static_cast<qk_t>(yr);
+      const float xr = x * cos_v - y * sin_v;
+      const float yr = y * cos_v + x * sin_v;
+      // No in-place write back to q_pe.
 
       write_q_out(q_out_base + kv_lora_rank_val + x_idx, xr);
       write_q_out(q_out_base + kv_lora_rank_val + y_idx, yr);
     }
 
-    // ---- Phase B: copy q_nope for this head → q_out[.., :L] ----
+    // ---- Phase B: copy q_nope → q_out[.., :L] ----
     const qk_t* q_nope_src =
         q_nope + token_idx * q_nope_stride_t + (int64_t)head * q_nope_stride_h;
     qk_t* q_out_dst = reinterpret_cast<qk_t*>(q_out) + q_out_base;
@@ -391,19 +396,15 @@ __global__ void fuse_mla_decode_rope_q_concat_kv_insert_kernel(
             reinterpret_cast<const copy_vec_t*>(q_nope_src);
         copy_vec_t* dst_vec = reinterpret_cast<copy_vec_t*>(q_out_dst);
         for (int vec_idx = threadIdx.x; vec_idx < num_vec;
-             vec_idx += blockDim.x) {
+             vec_idx += blockDim.x)
           dst_vec[vec_idx] = src_vec[vec_idx];
-        }
       } else {
-        for (int l = threadIdx.x; l < kv_lora_rank_val; l += blockDim.x) {
+        for (int l = threadIdx.x; l < kv_lora_rank_val; l += blockDim.x)
           q_out_dst[l] = q_nope_src[l];
-        }
       }
     } else {
-      for (int l = threadIdx.x; l < kv_lora_rank_val; l += blockDim.x) {
-        const float val = static_cast<float>(q_nope_src[l]);
-        write_q_out(q_out_base + l, val);
-      }
+      for (int l = threadIdx.x; l < kv_lora_rank_val; l += blockDim.x)
+        write_q_out(q_out_base + l, static_cast<float>(q_nope_src[l]));
     }
     return;
   }
@@ -418,12 +419,12 @@ __global__ void fuse_mla_decode_rope_q_concat_kv_insert_kernel(
       kv_cache + block_idx * block_stride + entry_idx * entry_stride;
 
   if (part_idx == num_q_heads) {
-    // ---- Phase C: RoPE on k_pe + write to kv_cache[L:] ----
+    // ---- Phase C: RoPE k_pe → kv_cache[L:] ----
     const qk_t* k_pe_src = kv + token_idx * kv_stride_t + kv_lora_rank_val;
     for (int pair_idx = threadIdx.x; pair_idx < embed_dim;
          pair_idx += blockDim.x) {
-      const float cos = static_cast<float>(VLLM_LDG(cos_sin_ptr + pair_idx));
-      const float sin =
+      const float cos_v = static_cast<float>(VLLM_LDG(cos_sin_ptr + pair_idx));
+      const float sin_v =
           static_cast<float>(VLLM_LDG(cos_sin_ptr + pair_idx + embed_dim));
 
       int x_idx, y_idx;
@@ -437,11 +438,10 @@ __global__ void fuse_mla_decode_rope_q_concat_kv_insert_kernel(
 
       const float x = static_cast<float>(k_pe_src[x_idx]);
       const float y = static_cast<float>(k_pe_src[y_idx]);
-      const float xr_f = x * cos - y * sin;
-      const float yr_f = y * cos + x * sin;
+      const float xr_f = x * cos_v - y * sin_v;
+      const float yr_f = y * cos_v + x * sin_v;
       const qk_t xr = static_cast<qk_t>(xr_f);
       const qk_t yr = static_cast<qk_t>(yr_f);
-
       const raw_kv_scalar_t raw_xr =
           *reinterpret_cast<const raw_kv_scalar_t*>(&xr);
       const raw_kv_scalar_t raw_yr =
@@ -462,15 +462,12 @@ __global__ void fuse_mla_decode_rope_q_concat_kv_insert_kernel(
     return;
   }
 
-  // ---- Phase D: tiled copy kv_c → kv_cache[:L] ----
+  // ---- Phase D: tiled kv_c copy → kv_cache[:L] ----
   constexpr int KV_COPY_TILE = 64;
   const int tile_idx = part_idx - num_q_heads - 1;
   const int tile_start = tile_idx * KV_COPY_TILE;
   const int tile_end = min(kv_lora_rank_val, tile_start + KV_COPY_TILE);
-
-  if (tile_start >= kv_lora_rank_val) {
-    return;
-  }
+  if (tile_start >= kv_lora_rank_val) return;
 
   const qk_t* kv_c_src = kv + token_idx * kv_stride_t;
   if constexpr (kv_dt == Fp8KVCacheDataType::kAuto &&
@@ -482,33 +479,26 @@ __global__ void fuse_mla_decode_rope_q_concat_kv_insert_kernel(
         tile_start % cache_vec_elts == 0 && tile_len % cache_vec_elts == 0 &&
         reinterpret_cast<uintptr_t>(tile_src) % alignof(copy_vec_t) == 0 &&
         reinterpret_cast<uintptr_t>(tile_dst) % alignof(copy_vec_t) == 0;
-
     if (can_vec_kv) {
       const int num_vec = tile_len / cache_vec_elts;
       const copy_vec_t* src_vec = reinterpret_cast<const copy_vec_t*>(tile_src);
       copy_vec_t* dst_vec = reinterpret_cast<copy_vec_t*>(tile_dst);
-      for (int vec_idx = threadIdx.x; vec_idx < num_vec;
-           vec_idx += blockDim.x) {
-        dst_vec[vec_idx] = src_vec[vec_idx];
-      }
+      for (int v = threadIdx.x; v < num_vec; v += blockDim.x)
+        dst_vec[v] = src_vec[v];
     } else {
-      for (int i = tile_start + threadIdx.x; i < tile_end; i += blockDim.x) {
-        const qk_t val = kv_c_src[i];
-        kv_cache_ptr[i] = *reinterpret_cast<const cache_t*>(&val);
-      }
+      for (int i = tile_start + threadIdx.x; i < tile_end; i += blockDim.x)
+        kv_cache_ptr[i] = *reinterpret_cast<const cache_t*>(&kv_c_src[i]);
     }
   } else {
     for (int i = tile_start + threadIdx.x; i < tile_end; i += blockDim.x) {
       const qk_t val = kv_c_src[i];
       const raw_kv_scalar_t raw_val =
           *reinterpret_cast<const raw_kv_scalar_t*>(&val);
-
-      if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+      if constexpr (kv_dt == Fp8KVCacheDataType::kAuto)
         kv_cache_ptr[i] = raw_val;
-      } else {
+      else
         kv_cache_ptr[i] = fp8::scaled_convert<cache_t, raw_kv_scalar_t, kv_dt>(
             raw_val, *kv_scale);
-      }
     }
   }
 }
@@ -603,8 +593,8 @@ __global__ void fuse_mla_decode_rope_q_concat_kv_insert_kernel(
   } while (false)
 
 // Fused MLA decode forward:
-//   1. RoPE(q_pe in-place) + copy concat(q_nope, rope(q_pe)) → q_out
-//   2. RoPE(k_pe from kv in-place) + copy [kv_c | rope(k_pe)] → kv_cache
+//   1. RoPE(q_pe) + copy concat(q_nope, rope(q_pe)) → q_out  [q_pe read-only]
+//   2. RoPE(k_pe from kv) + copy [kv_c | rope(k_pe)] → kv_cache
 void fuse_mla_decode_rope_q_concat_kv_insert(
     torch::Tensor& positions,  // [num_tokens]
     torch::Tensor& q_nope,     // [num_tokens, num_q_heads, kv_lora_rank]
@@ -679,11 +669,9 @@ void fuse_mla_decode_rope_q_concat_kv_insert(
   const int block_stride = kv_cache.stride(0);
   const int entry_stride = kv_cache.stride(1);
 
-  constexpr int kv_copy_tile = 64;
   const bool use_specialized_shape = (kv_lora_rank == 512 && rot_dim == 64);
-  const int num_kv_tiles = (kv_lora_rank + kv_copy_tile - 1) / kv_copy_tile;
+  const int num_kv_tiles = (kv_lora_rank + 63) / 64;
   const int thread_block_size = use_specialized_shape ? 128 : 256;
-
   dim3 grid(num_tokens, num_q_heads + 1 + num_kv_tiles, 1);
   dim3 block(thread_block_size, 1, 1);
 
