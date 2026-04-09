@@ -64,7 +64,10 @@ def create_fp4_scale_tensor(
             (rounded_m, rounded_n // 4), device=device, dtype=torch.int32
         )
     else:
-        return torch.zeros((m, n // block_size), device=device, dtype=torch.uint8)
+        # No padding in the non-swizzled layout: kernel writes every entry
+        # (loop bound is exactly numRows, no column padding), so torch.empty
+        # is safe and avoids a separate cudaMemset launch.
+        return torch.empty((m, n // block_size), device=device, dtype=torch.uint8)
 
 
 def create_fp4_output_tensors(

@@ -178,8 +178,8 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
       PackedVec in_vec;
       int64_t inOffset = rowIdx * (numCols / CVT_FP4_ELTS_PER_THREAD) + colIdx;
 
-      // If we are outside valid rows OR outside valid columns -> Use Zeros
-      bool valid = (rowIdx < numRows) && (elem_idx < numCols);
+      // rowIdx < numRows is guaranteed by the loop bound; only guard columns.
+      bool valid = (elem_idx < numCols);
       if constexpr (CVT_FP4_PACK16) {
         ld256_cg_or_zero(reinterpret_cast<u32x8_t&>(in_vec),
                          &reinterpret_cast<const uint32_t*>(in)[inOffset * 8],
