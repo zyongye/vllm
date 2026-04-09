@@ -338,6 +338,12 @@ __global__ void fuse_mla_decode_rope_q_concat_kv_insert_kernel(
     }
   };
 
+  // Wait for predecessor grid after all init/pointer setup so we overlap as
+  // much work as possible with the previous kernel.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+
   // TRT-LLM-style partitioning:
   //   [0, num_q_heads)      : one block per Q head
   //   [num_q_heads]         : one block for K rope
@@ -506,21 +512,35 @@ __global__ void fuse_mla_decode_rope_q_concat_kv_insert_kernel(
 }  // namespace vllm
 
 // Inner helper: launch the kernel for a fixed (qk_t, cos_sin_t) pair.
-#define LAUNCH_FUSE_MLA_DECODE_ROPE_Q_CONCAT_KV_INSERT(                     \
-    QK_T, COS_SIN_T, IS_NEOX, RAW_KV_T, CACHE_T, KV_DTYPE, DO_FP8_Q,        \
-    STATIC_KV_LORA_RANK, STATIC_ROT_DIM, COS_SIN_PTR)                       \
-  vllm::fuse_mla_decode_rope_q_concat_kv_insert_kernel<                     \
-      QK_T, IS_NEOX, RAW_KV_T, CACHE_T, KV_DTYPE, DO_FP8_Q,                 \
-      STATIC_KV_LORA_RANK, STATIC_ROT_DIM, COS_SIN_T>                       \
-      <<<grid, block, 0, stream>>>(                                         \
-          positions.data_ptr<int64_t>(), q_nope.data_ptr<QK_T>(),           \
-          q_pe.data_ptr<QK_T>(), kv.data_ptr<QK_T>(), COS_SIN_PTR, rot_dim, \
-          kv_lora_rank, num_q_heads, q_nope_stride_t, q_nope_stride_h,      \
-          q_pe_stride_t, q_pe_stride_h, kv_stride_t,                        \
-          reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                  \
-          slot_mapping.data_ptr<int64_t>(), block_size, block_stride,       \
-          entry_stride, kv_scale.data_ptr<float>(), q_out.data_ptr(),       \
-          q_out_stride_t, q_out_stride_h, q_scale_ptr)
+// Uses cudaLaunchKernelEx so PDL (programmatic stream serialization) can be
+// enabled on SM90+ without a separate code path.
+#define LAUNCH_FUSE_MLA_DECODE_ROPE_Q_CONCAT_KV_INSERT(                       \
+    QK_T, COS_SIN_T, IS_NEOX, RAW_KV_T, CACHE_T, KV_DTYPE, DO_FP8_Q,          \
+    STATIC_KV_LORA_RANK, STATIC_ROT_DIM, COS_SIN_PTR)                         \
+  do {                                                                        \
+    auto* _kernel = &vllm::fuse_mla_decode_rope_q_concat_kv_insert_kernel<    \
+        QK_T, IS_NEOX, RAW_KV_T, CACHE_T, KV_DTYPE, DO_FP8_Q,                 \
+        STATIC_KV_LORA_RANK, STATIC_ROT_DIM, COS_SIN_T>;                      \
+    cudaLaunchConfig_t _cfg;                                                  \
+    _cfg.gridDim = grid;                                                      \
+    _cfg.blockDim = block;                                                    \
+    _cfg.dynamicSmemBytes = 0;                                                \
+    _cfg.stream = stream;                                                     \
+    cudaLaunchAttribute _attr[1];                                             \
+    _attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;         \
+    _attr[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0; \
+    _cfg.numAttrs = 1;                                                        \
+    _cfg.attrs = _attr;                                                       \
+    cudaLaunchKernelEx(                                                       \
+        &_cfg, _kernel, positions.data_ptr<int64_t>(),                        \
+        q_nope.data_ptr<QK_T>(), q_pe.data_ptr<QK_T>(), kv.data_ptr<QK_T>(),  \
+        COS_SIN_PTR, rot_dim, kv_lora_rank, num_q_heads, q_nope_stride_t,     \
+        q_nope_stride_h, q_pe_stride_t, q_pe_stride_h, kv_stride_t,           \
+        reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                      \
+        slot_mapping.data_ptr<int64_t>(), block_size, block_stride,           \
+        entry_stride, kv_scale.data_ptr<float>(), q_out.data_ptr(),           \
+        q_out_stride_t, q_out_stride_h, q_scale_ptr);                         \
+  } while (false)
 
 #define LAUNCH_FUSE_MLA_DECODE_SPECIALIZED_OR_GENERIC(                        \
     QK_T, COS_SIN_T, IS_NEOX, RAW_KV_T, CACHE_T, KV_DTYPE, DO_FP8_Q,          \
@@ -677,6 +697,12 @@ void fuse_mla_decode_rope_q_concat_kv_insert(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(positions));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  // Auto-enable PDL on SM90+.
+  int sm_major = 0;
+  cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor,
+                         static_cast<int>(q_pe.get_device()));
+  bool const enable_pdl = (sm_major >= 9);
 
   DISPATCH_BY_KV_CACHE_DTYPE(kv.dtype(), kv_cache_dtype,
                              CALL_FUSE_MLA_DECODE_ROPE_Q_CONCAT_KV_INSERT);
