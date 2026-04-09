@@ -39,6 +39,15 @@ void concat_and_cache_mla_rope_fused(
     torch::Tensor& kv_cache_slot_mapping, torch::Tensor& kv_cache,
     const std::string& kv_cache_dtype, torch::Tensor& kv_cache_quant_scale);
 
+// Fused MLA decode: RoPE(q_pe) + concat(q_nope, rope(q_pe)) -> q_out,
+//                   RoPE(k_pe from kv) + [kv_c | rope(k_pe)] -> kv_cache.
+void fuse_mla_decode_rope_q_concat_kv_insert(
+    torch::Tensor& positions, torch::Tensor& q_nope, torch::Tensor& q_pe,
+    torch::Tensor& kv, torch::Tensor& cos_sin_cache, bool rope_is_neox,
+    torch::Tensor& slot_mapping, torch::Tensor& kv_cache,
+    const std::string& kv_cache_dtype, torch::Tensor& kv_scale,
+    const c10::optional<torch::Tensor>& q_scale, torch::Tensor& q_out);
+
 // Just for unittest
 void convert_fp8(torch::Tensor& dst_cache, torch::Tensor& src_cache,
                  const double scale, const std::string& kv_cache_dtype);

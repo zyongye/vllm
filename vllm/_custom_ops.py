@@ -2616,6 +2616,36 @@ def concat_and_cache_mla_rope_fused(
     )
 
 
+def fuse_mla_decode_rope_q_concat_kv_insert(
+    positions: torch.Tensor,
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    slot_mapping: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_cache_dtype: str,
+    kv_scale: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    q_out: torch.Tensor,
+) -> None:
+    torch.ops._C_cache_ops.fuse_mla_decode_rope_q_concat_kv_insert(
+        positions,
+        q_nope,
+        q_pe,
+        kv,
+        cos_sin_cache,
+        is_neox,
+        slot_mapping,
+        kv_cache,
+        kv_cache_dtype,
+        kv_scale,
+        q_scale,
+        q_out,
+    )
+
+
 def swap_blocks(
     src: torch.Tensor,
     dst: torch.Tensor,

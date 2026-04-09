@@ -565,6 +565,24 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   cache_ops.impl("concat_and_cache_mla_rope_fused", torch::kCUDA,
                  &concat_and_cache_mla_rope_fused);
 
+  // Fused MLA decode: RoPE(q_pe+k_pe), concat q_nope+q_pe -> q_out, kv insert
+  cache_ops.def(
+      "fuse_mla_decode_rope_q_concat_kv_insert("
+      "    Tensor positions,"
+      "    Tensor q_nope,"
+      "    Tensor! q_pe,"
+      "    Tensor kv,"
+      "    Tensor cos_sin_cache,"
+      "    bool rope_is_neox,"
+      "    Tensor slot_mapping,"
+      "    Tensor! kv_cache,"
+      "    str kv_cache_dtype,"
+      "    Tensor kv_scale,"
+      "    Tensor? q_scale,"
+      "    Tensor! q_out) -> ()");
+  cache_ops.impl("fuse_mla_decode_rope_q_concat_kv_insert", torch::kCUDA,
+                 &fuse_mla_decode_rope_q_concat_kv_insert);
+
   // Convert the key and value cache to fp8 data type.
   cache_ops.def(
       "convert_fp8(Tensor! dst_cache, Tensor src_cache, float scale, "

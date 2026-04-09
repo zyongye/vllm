@@ -115,6 +115,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             kv_b_proj=self.kv_b_proj,
             use_sparse=self.is_sparse,
             indexer=self.indexer,
+            rotary_emb=self.rotary_emb,
         )
 
         self.prefix = prefix
@@ -136,6 +137,20 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         return maybe_execute_in_parallel(
             lambda: self.q_a_layernorm(q_c),
             lambda: self.kv_a_layernorm(kv_c),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+
+    def _q_proj_kv_concat_mla(
+        self,
+        q_c: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+    ):
+        return maybe_execute_in_parallel(
+            lambda: self.q_b_proj(q_c)[0],
+            lambda: torch.cat([kv_c_normed, k_pe], dim=-1),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
@@ -171,14 +186,13 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 kv_c,
                 self.prefix,
             )
-            # q_c, kv_c_normed = maybe_execute_in_parallel(
-            #     lambda: self.q_a_layernorm(q_c),
-            #     lambda: self.kv_a_layernorm(kv_c),
-            #     self.ln_events[0],
-            #     self.ln_events[1],
-            #     self.aux_stream,
-            # )
-            q = self.q_b_proj(q_c)[0]
+
+            q, kv = torch.ops.vllm.q_proj_kv_concat_mla(
+                q_c,
+                kv_c_normed,
+                k_pe,
+                self.prefix,
+            )
         else:
             assert self.kv_a_proj_with_mqa is not None, (
                 "kv_a_proj_with_mqa is required when q_lora_rank is None"
@@ -192,15 +206,11 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
             kv_c_normed = self.kv_a_layernorm(kv_c)
+            # Concatenate kv_c_normed [S, kv_lora_rank] and k_pe [S, qk_rope_head_dim]
+            # into a single kv tensor [S, kv_lora_rank + qk_rope_head_dim]
+            kv = torch.cat([kv_c_normed, k_pe], dim=-1)
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
-        # Add head dim of 1 to k_pe
-        k_pe = k_pe.unsqueeze(1)
-
-        if self.rotary_emb is not None:
-            q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
-                positions, q[..., self.qk_nope_head_dim :], k_pe
-            )
 
         if self.indexer and self.is_sparse:
             _topk_indices = self.indexer(
@@ -210,10 +220,11 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         if llama_4_scaling is not None:
             q *= llama_4_scaling
 
+        # q is not roped
         attn_out = self.mla_attn(
             q,
-            kv_c_normed,
-            k_pe,
+            kv,
+            positions,
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
         )
 
@@ -247,4 +258,40 @@ direct_register_custom_op(
     op_name="mla_qkv_norm",
     op_func=mla_qkv_norm,
     fake_impl=mla_qkv_norm_fake,
+)
+
+
+def q_proj_kv_concat_mla(
+    q_c: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    forward_context: ForwardContext = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+
+    return self._q_proj_kv_concat_mla(q_c, kv_c_normed, k_pe)
+
+
+def q_proj_kv_concat_mla_fake(
+    q_c: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    forward_context: ForwardContext = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    # q_b_proj projects [S, q_lora_rank] -> [S, num_heads * qk_head_dim]
+    q = q_c.new_empty(q_c.shape[0], self.num_heads * self.qk_head_dim)
+    # torch.cat along last dim: [S, kv_lora_rank + qk_rope_head_dim]
+    kv = kv_c_normed.new_empty(
+        kv_c_normed.shape[0], kv_c_normed.shape[1] + k_pe.shape[1]
+    )
+    return q, kv
+
+
+direct_register_custom_op(
+    op_name="q_proj_kv_concat_mla",
+    op_func=q_proj_kv_concat_mla,
+    fake_impl=q_proj_kv_concat_mla_fake,
 )
