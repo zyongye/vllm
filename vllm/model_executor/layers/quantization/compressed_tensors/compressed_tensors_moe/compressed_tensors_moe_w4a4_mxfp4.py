@@ -15,8 +15,8 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
     MarlinExperts,
 )
-from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
-    Mxfp4MoeBackend,
+from vllm.model_executor.layers.fused_moe.oracle.gpt_oss_mxfp4 import (
+    GptOssMxfp4MoeBackend,
     make_mxfp4_moe_kernel,
     make_mxfp4_moe_quant_config,
 )
@@ -35,7 +35,7 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
     def __init__(self, moe):
         super().__init__(moe)
         self.group_size = 32
-        self.mxfp4_backend = Mxfp4MoeBackend.MARLIN
+        self.mxfp4_backend = GptOssMxfp4MoeBackend.MARLIN
         self.experts_cls = MarlinExperts
 
     def create_weights(
