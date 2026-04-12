@@ -71,9 +71,15 @@ class Mxfp4Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
+        # Mxfp4Config is a base class — it should only be instantiated when
+        # a checkpoint has quant_method="mxfp4" but no model-specific subclass
+        # claimed it via override_quantization_method(). This means the model
+        # type is not supported for MXFP4 quantization.
         raise NotImplementedError(
             f"{type(self).__name__} does not implement get_quant_method. "
-            "Use a model-specific subclass (e.g. GptOssMxfp4Config)."
+            "The checkpoint has quant_method='mxfp4' but no registered "
+            "subclass claimed it. If this is a GPT-OSS checkpoint, ensure "
+            "the model config has model_type='gpt_oss'."
         )
 
     def is_mxfp4_quant(self, prefix: str, layer: torch.nn.Module) -> bool:

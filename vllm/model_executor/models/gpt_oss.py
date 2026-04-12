@@ -1116,7 +1116,18 @@ class GptOssModel(nn.Module, EagleModelMixin):
             if hasattr(self.config, "quantization_config")
             else None
         )
-        # Normalize legacy checkpoint name to the current internal name.
+        # Normalize the checkpoint's quant_method to the internal name.
+        # Note: there are three places where "mxfp4" -> "gpt_oss_mxfp4"
+        # normalization occurs, each serving a different data path:
+        #   1. GptOssMxfp4Config.override_quantization_method() — sets
+        #      ModelConfig.quantization (used to select the QuantizationConfig
+        #      class at model init time), reading from model_arch_config which
+        #      is a snapshot taken before verify_and_update_model_config runs.
+        #   2. GptOssForCausalLMConfig.verify_and_update_model_config() —
+        #      patches hf_config.quantization_config in-place (a separate copy
+        #      of the dict from model_arch_config) for later hf_config lookups.
+        #   3. Here — reads directly from self.config (the raw HF config) which
+        #      may still carry the original "mxfp4" string from the checkpoint.
         if quant_method == "mxfp4":
             quant_method = "gpt_oss_mxfp4"
 
