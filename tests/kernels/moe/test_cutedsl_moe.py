@@ -142,7 +142,9 @@ def prepare_inputs(
     # Initialize the hidden_states_3d with ones instead of empty to avoid nan
     # issue.
     hidden_states_3d = torch.ones(
-        (num_experts, max(masked_m), hidden_states.shape[1]), dtype=hidden_states.dtype
+        (num_experts, max(masked_m), hidden_states.shape[1]),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
     )
     for i in range(num_experts):
         hidden_states_3d[i, : masked_m[i], :] = hidden_states[topk_idx.view(-1) == i]
