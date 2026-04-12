@@ -68,51 +68,8 @@ class Mxfp4Config(QuantizationConfig):
     def get_config_filenames(cls) -> list[str]:
         return []
 
-    def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> "QuantizeMethodBase | None":
-        # Mxfp4Config is a base class — it should only be instantiated when
-        # a checkpoint has quant_method="mxfp4" but no model-specific subclass
-        # claimed it via override_quantization_method(). This means the model
-        # type is not supported for MXFP4 quantization.
-        raise NotImplementedError(
-            f"{type(self).__name__} does not implement get_quant_method. "
-            "The checkpoint has quant_method='mxfp4' but no registered "
-            "subclass claimed it. If this is a GPT-OSS checkpoint, ensure "
-            "the model config has model_type='gpt_oss'."
-        )
-
-    def is_mxfp4_quant(self, prefix: str, layer: torch.nn.Module) -> bool:
-        """MXFP4 config always uses MXFP4 quantization."""
-        return True
-
-
-class GptOssMxfp4Config(Mxfp4Config):
-    """MXFP4 config for GPT-OSS checkpoints.
-
-    Checkpoints carry ``"quant_method": "mxfp4"`` in their JSON config.
-    override_quantization_method() maps that to the canonical internal name
-    so that the rest of the loading path uses "gpt_oss_mxfp4" consistently.
-    """
-
-    @classmethod
-    def get_name(cls) -> QuantizationMethods:
-        return "gpt_oss_mxfp4"
-
-    @classmethod
-    def override_quantization_method(
-        cls, hf_quant_cfg, user_quant, hf_config=None
-    ) -> QuantizationMethods | None:
-        if not (
-            isinstance(hf_quant_cfg, dict)
-            and hf_quant_cfg.get("quant_method") == "mxfp4"
-        ):
-            return None
-        model_type = getattr(hf_config, "model_type", None)
-        if model_type is not None and model_type != "gpt_oss":
-            return None
-        return "gpt_oss_mxfp4"
-
+    # TODO (zyongye) This is only temporaty fallback.
+    # We should have `Mxfp4MoEMethod` after this migration is complete.
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
@@ -138,6 +95,43 @@ class GptOssMxfp4Config(Mxfp4Config):
                 scope="local",
             )
         return None
+
+    def is_mxfp4_quant(self, prefix: str, layer: torch.nn.Module) -> bool:
+        """MXFP4 config always uses MXFP4 quantization."""
+        return True
+
+
+class GptOssMxfp4Config(Mxfp4Config):
+    """MXFP4 config for GPT-OSS checkpoints.
+
+    Checkpoints carry ``"quant_method": "mxfp4"`` in their JSON config.
+    override_quantization_method() maps that to the canonical internal name
+    so that the rest of the loading path uses "gpt_oss_mxfp4" consistently.
+    """
+
+    @classmethod
+    def get_name(cls) -> QuantizationMethods:
+        return "gpt_oss_mxfp4"
+
+    @classmethod
+    def override_quantization_method(
+        cls, hf_quant_cfg, user_quant, hf_config=None
+    ) -> QuantizationMethods | None:
+        # Match both "mxfp4" (original checkpoint value) and "gpt_oss_mxfp4"
+        # (already normalized by verify_and_update_model_config) so that
+        # explicit --quantization mxfp4 from the user doesn't cause a mismatch.
+        if not (
+            isinstance(hf_quant_cfg, dict)
+            and hf_quant_cfg.get("quant_method") in ("mxfp4", "gpt_oss_mxfp4")
+        ):
+            return None
+        # Require explicit confirmation that this is a GPT-OSS model.
+        # Do NOT fall back to returning the override when hf_config is None,
+        # as that would silently claim all mxfp4 checkpoints.
+        model_type = getattr(hf_config, "model_type", None)
+        if model_type != "gpt_oss":
+            return None
+        return "gpt_oss_mxfp4"
 
 
 class GptOssMxfp4MoEMethod(FusedMoEMethodBase):

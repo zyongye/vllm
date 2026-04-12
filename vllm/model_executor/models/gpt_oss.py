@@ -560,6 +560,14 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 pcp_rank=get_pcp_group().rank_in_group,
             )
 
+        def _is_mxfp4(weight_dtype: str | None) -> bool:
+            """Return True for any MXFP4 weight-dtype variant.
+
+            Covers "gpt_oss_mxfp4" (GptOssMxfp4MoEMethod) and "mxfp4"
+            (QuarkMoEMethod with fp4 weights) and any future variants.
+            """
+            return weight_dtype is not None and "mxfp4" in weight_dtype
+
         def _get_moe_weight_dtype(layer_id: int = 0) -> str | None:
             """Helper function to get MoE quantization weight dtype.
 
@@ -578,7 +586,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
 
         moe_weight_dtype = _get_moe_weight_dtype(layer_id=0)
 
-        if moe_weight_dtype == "gpt_oss_mxfp4":
+        if _is_mxfp4(moe_weight_dtype):
             # MXFP4 requires OCP_MX_BLOCK_SIZE alignment
             intermediate_size_block = intermediate_size // OCP_MX_BLOCK_SIZE
             per_rank_intermediate_size_block = cdiv(intermediate_size_block, tp_size)
@@ -682,7 +690,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 continue
 
             # Unified handler for mxfp4 weights and scales
-            elif moe_quant_method == "gpt_oss_mxfp4" and any(
+            elif _is_mxfp4(moe_quant_method) and any(
                 name.endswith(suffix)
                 for suffix in [
                     ".w13_weight_scale",
