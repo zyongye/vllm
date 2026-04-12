@@ -37,7 +37,13 @@ from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 logger = init_logger(__name__)
 
 
-class GptOssMxfp4Config(QuantizationConfig):
+class Mxfp4Config(QuantizationConfig):
+    """Canonical base config for MXFP4 quantization.
+
+    Subclasses override get_name() and override_quantization_method() to
+    register themselves as the handler for a specific checkpoint format.
+    """
+
     def __init__(self, ignored_layers: list[str] | None = None):
         super().__init__()
         self.ignored_layers = ignored_layers
@@ -52,7 +58,7 @@ class GptOssMxfp4Config(QuantizationConfig):
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
-        return "gpt_oss_mxfp4"
+        return "mxfp4"
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
@@ -61,6 +67,45 @@ class GptOssMxfp4Config(QuantizationConfig):
     @classmethod
     def get_config_filenames(cls) -> list[str]:
         return []
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement get_quant_method. "
+            "Use a model-specific subclass (e.g. GptOssMxfp4Config)."
+        )
+
+    def is_mxfp4_quant(self, prefix: str, layer: torch.nn.Module) -> bool:
+        """MXFP4 config always uses MXFP4 quantization."""
+        return True
+
+
+class GptOssMxfp4Config(Mxfp4Config):
+    """MXFP4 config for GPT-OSS checkpoints.
+
+    Checkpoints carry ``"quant_method": "mxfp4"`` in their JSON config.
+    override_quantization_method() maps that to the canonical internal name
+    so that the rest of the loading path uses "gpt_oss_mxfp4" consistently.
+    """
+
+    @classmethod
+    def get_name(cls) -> QuantizationMethods:
+        return "gpt_oss_mxfp4"
+
+    @classmethod
+    def override_quantization_method(
+        cls, hf_quant_cfg, user_quant, hf_config=None
+    ) -> QuantizationMethods | None:
+        if not (
+            isinstance(hf_quant_cfg, dict)
+            and hf_quant_cfg.get("quant_method") == "mxfp4"
+        ):
+            return None
+        model_type = getattr(hf_config, "model_type", None)
+        if model_type is not None and model_type != "gpt_oss":
+            return None
+        return "gpt_oss_mxfp4"
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -87,10 +132,6 @@ class GptOssMxfp4Config(QuantizationConfig):
                 scope="local",
             )
         return None
-
-    def is_mxfp4_quant(self, prefix: str, layer: torch.nn.Module) -> bool:
-        """MXFP4 config always uses MXFP4 quantization."""
-        return True
 
 
 class GptOssMxfp4MoEMethod(FusedMoEMethodBase):

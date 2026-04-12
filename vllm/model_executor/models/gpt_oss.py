@@ -1116,8 +1116,11 @@ class GptOssModel(nn.Module, EagleModelMixin):
             if hasattr(self.config, "quantization_config")
             else None
         )
+        # Normalize legacy checkpoint name to the current internal name.
+        if quant_method == "mxfp4":
+            quant_method = "gpt_oss_mxfp4"
 
-        if quant_method in ("mxfp4", "gpt_oss_mxfp4"):
+        if quant_method == "gpt_oss_mxfp4":
             return self._load_weights_mxfp4(
                 ep_rank_end,
                 ep_rank_start,
