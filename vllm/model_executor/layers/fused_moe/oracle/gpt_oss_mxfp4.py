@@ -780,7 +780,7 @@ def convert_to_mxfp4_moe_kernel_format(
         )
 
 
-def make_mxfp4_moe_quant_config(
+def make_gpt_oss_mxfp4_moe_quant_config(
     mxfp4_backend: GptOssMxfp4MoeBackend,
     w1_scale: Union[torch.Tensor, "PrecisionConfig"],
     w2_scale: Union[torch.Tensor, "PrecisionConfig"],
@@ -823,7 +823,7 @@ def make_mxfp4_moe_quant_config(
         )
 
 
-def make_mxfp4_moe_kernel(
+def make_gpt_oss_mxfp4_moe_kernel(
     moe_quant_config: FusedMoEQuantConfig,
     moe_config: FusedMoEConfig,
     experts_cls: type[mk.FusedMoEExperts],

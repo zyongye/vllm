@@ -31,8 +31,8 @@ from vllm.model_executor.layers.fused_moe.oracle.gpt_oss_mxfp4 import (
     TRITON_BACKENDS,
     GptOssMxfp4MoeBackend,
     convert_to_mxfp4_moe_kernel_format,
-    make_mxfp4_moe_kernel,
-    make_mxfp4_moe_quant_config,
+    make_gpt_oss_mxfp4_moe_kernel,
+    make_gpt_oss_mxfp4_moe_quant_config,
     mxfp4_round_up_hidden_size_and_intermediate_size,
     select_mxfp4_moe_backend,
 )
@@ -1333,7 +1333,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         # Build quant config and kernel
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config is not None and self.experts_cls is not None:
-            self.moe_kernel = make_mxfp4_moe_kernel(
+            self.moe_kernel = make_gpt_oss_mxfp4_moe_kernel(
                 moe_quant_config=self.moe_quant_config,
                 moe_config=self.moe,
                 mxfp4_backend=self.mxfp4_backend,
@@ -1355,7 +1355,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             if self.mxfp4_backend in TRITON_BACKENDS:
                 w1_scale = self.w13_precision_config
                 w2_scale = self.w2_precision_config
-            return make_mxfp4_moe_quant_config(
+            return make_gpt_oss_mxfp4_moe_quant_config(
                 mxfp4_backend=self.mxfp4_backend,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,

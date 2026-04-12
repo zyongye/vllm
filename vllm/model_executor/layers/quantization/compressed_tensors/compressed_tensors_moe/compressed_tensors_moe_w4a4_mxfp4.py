@@ -17,8 +17,8 @@ from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
 )
 from vllm.model_executor.layers.fused_moe.oracle.gpt_oss_mxfp4 import (
     GptOssMxfp4MoeBackend,
-    make_mxfp4_moe_kernel,
-    make_mxfp4_moe_quant_config,
+    make_gpt_oss_mxfp4_moe_kernel,
+    make_gpt_oss_mxfp4_moe_quant_config,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa E501
     CompressedTensorsMoEMethod,
@@ -109,7 +109,7 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
-        return make_mxfp4_moe_quant_config(
+        return make_gpt_oss_mxfp4_moe_quant_config(
             mxfp4_backend=self.mxfp4_backend,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
@@ -136,7 +136,7 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
 
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config is not None:
-            self.moe_kernel = make_mxfp4_moe_kernel(
+            self.moe_kernel = make_gpt_oss_mxfp4_moe_kernel(
                 moe_quant_config=self.moe_quant_config,
                 moe_config=self.moe,
                 experts_cls=self.experts_cls,
