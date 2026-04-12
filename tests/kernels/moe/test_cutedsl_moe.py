@@ -426,7 +426,7 @@ def test_flashinfer_cutedsl_moe_masked(
     w1_alpha = 1.0 / (input_global_scale * w1_global_scale)
     w2_alpha = 1.0 / (a2_global_scale * w2_global_scale)
 
-    out = torch.empty_like(hidden_states_3d)
+    out = torch.empty_like(hidden_states_3d, device=hidden_states.device)
     # Note: the 1st dim shouldn't be bs
     wk = torch.empty(
         num_experts,
