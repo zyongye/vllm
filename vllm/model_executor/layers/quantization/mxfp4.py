@@ -18,7 +18,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.oracle.gpt_oss_mxfp4 import (
     TRITON_BACKENDS,
-    GptOssMxfp4MoeBackend,
+    Mxfp4MoeBackend,
     convert_gpt_oss_weight_to_mxfp4_moe_kernel_format,
     make_gpt_oss_mxfp4_moe_kernel,
     make_gpt_oss_mxfp4_moe_quant_config,
@@ -157,7 +157,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
     def skip_forward_padding(self) -> bool:
         # SM100_FI_MXFP4_MXFP8_TRTLLM supports padding with mxfp8 quant
         # so can skip the padding in the forward before applying the moe method
-        return self.mxfp4_backend == GptOssMxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8
+        return self.mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8
 
     def maybe_roundup_sizes(
         self,
@@ -374,7 +374,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         w13_bias = getattr(layer, "w13_bias", None)
         w2_bias = getattr(layer, "w2_bias", None)
 
-        if self.mxfp4_backend == GptOssMxfp4MoeBackend.NONE:
+        if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
             return
 
         self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)

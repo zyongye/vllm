@@ -29,7 +29,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.fused_marlin_moe import fused_marlin_moe
 from vllm.model_executor.layers.fused_moe.oracle.gpt_oss_mxfp4 import (
     TRITON_BACKENDS,
-    GptOssMxfp4MoeBackend,
+    Mxfp4MoeBackend,
     convert_gpt_oss_weight_to_mxfp4_moe_kernel_format,
     make_gpt_oss_mxfp4_moe_kernel,
     make_gpt_oss_mxfp4_moe_quant_config,
@@ -986,7 +986,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
                 f"Please check that the combination is supported in OCP_MX_Scheme."
             )
 
-        self.mxfp4_backend: GptOssMxfp4MoeBackend = GptOssMxfp4MoeBackend.NONE
+        self.mxfp4_backend: Mxfp4MoeBackend = Mxfp4MoeBackend.NONE
         self.experts_cls: type[mk.FusedMoEExperts] | None = None
         self.moe_kernel: mk.FusedMoEKernel | None = None
 
@@ -998,7 +998,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             self.mxfp4_backend, self.experts_cls = select_gpt_oss_mxfp4_moe_backend(moe)
         elif self.ocp_mx_scheme.startswith("w_mxfp4"):
             # TODO(bowenbao): refactor and introduce backends for other OCP MX schemes.
-            self.mxfp4_backend = GptOssMxfp4MoeBackend.NONE
+            self.mxfp4_backend = Mxfp4MoeBackend.NONE
 
         if self.input_quant is not None:
             self.static_input_scales = not self.input_quant.get("is_dynamic")
@@ -1032,8 +1032,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             not current_platform.supports_mx()
             or not self.ocp_mx_scheme.startswith("w_mxfp4")
         ) and (
-            self.mxfp4_backend is GptOssMxfp4MoeBackend.NONE
-            or not self.use_rocm_aiter_moe
+            self.mxfp4_backend is Mxfp4MoeBackend.NONE or not self.use_rocm_aiter_moe
         )
 
         if self.emulate:
@@ -1240,7 +1239,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         # For w_mxfp4, use oracle functions
         if (
             self.ocp_mx_scheme == "w_mxfp4"
-            and self.mxfp4_backend != GptOssMxfp4MoeBackend.NONE
+            and self.mxfp4_backend != Mxfp4MoeBackend.NONE
         ):
             self._setup_kernel_via_oracle(layer)
             return
@@ -1348,7 +1347,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         # For w_mxfp4 with oracle backend, use oracle function
         if (
             self.ocp_mx_scheme == "w_mxfp4"
-            and self.mxfp4_backend != GptOssMxfp4MoeBackend.NONE
+            and self.mxfp4_backend != Mxfp4MoeBackend.NONE
         ):
             w1_scale = layer.w13_weight_scale
             w2_scale = layer.w2_weight_scale
