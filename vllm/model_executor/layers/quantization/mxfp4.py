@@ -19,11 +19,11 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.oracle.gpt_oss_mxfp4 import (
     TRITON_BACKENDS,
     GptOssMxfp4MoeBackend,
-    convert_to_mxfp4_moe_kernel_format,
+    convert_gpt_oss_weight_to_mxfp4_moe_kernel_format,
     make_gpt_oss_mxfp4_moe_kernel,
     make_gpt_oss_mxfp4_moe_quant_config,
     mxfp4_round_up_hidden_size_and_intermediate_size,
-    select_mxfp4_moe_backend,
+    select_gpt_oss_mxfp4_moe_backend,
 )
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -140,7 +140,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
         self.weight_dtype = "gpt_oss_mxfp4"
-        self.mxfp4_backend, self.experts_cls = select_mxfp4_moe_backend(moe)
+        self.mxfp4_backend, self.experts_cls = select_gpt_oss_mxfp4_moe_backend(moe)
 
         self.max_capture_size = (
             get_current_vllm_config().compilation_config.max_cudagraph_capture_size
@@ -322,7 +322,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
 
         # Convert weights to kernel format
         w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
-            convert_to_mxfp4_moe_kernel_format(
+            convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
                 mxfp4_backend=self.mxfp4_backend,
                 layer=layer,
                 w13_weight=w13,
