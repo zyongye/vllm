@@ -194,7 +194,7 @@ def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
     return None
 
 
-def select_gpt_oss_mxfp4_moe_backend(
+def select_mxfp4_moe_backend(
     config: FusedMoEConfig,
 ) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts] | None]:
     """
@@ -400,7 +400,7 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
     return hidden_size, intermediate_size
 
 
-def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
+def convert_to_mxfp4_moe_kernel_format(
     mxfp4_backend: Mxfp4MoeBackend,
     layer: torch.nn.Module,
     w13_weight: torch.Tensor,
@@ -772,7 +772,7 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
         )
 
 
-def make_gpt_oss_mxfp4_moe_quant_config(
+def make_mxfp4_moe_quant_config(
     mxfp4_backend: Mxfp4MoeBackend,
     w1_scale: Union[torch.Tensor, "PrecisionConfig"],
     w2_scale: Union[torch.Tensor, "PrecisionConfig"],
@@ -815,7 +815,7 @@ def make_gpt_oss_mxfp4_moe_quant_config(
         )
 
 
-def make_gpt_oss_mxfp4_moe_kernel(
+def make_mxfp4_moe_kernel(
     moe_quant_config: FusedMoEQuantConfig,
     moe_config: FusedMoEConfig,
     experts_cls: type[mk.FusedMoEExperts],
