@@ -9,7 +9,7 @@ from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     _ceil_to_ue8m0,
     calc_diff,
-    fp8_mqa_logits,
+    fp8_fp4_mqa_logits,
     fp8_paged_mqa_logits,
     get_num_sms,
     get_paged_mqa_logits_metadata,
@@ -127,7 +127,7 @@ def test_deepgemm_fp8_mqa_logits(clean_logits: bool):
 
                 q_fp8 = q.to(torch.float8_e4m3fn)
                 kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0,), False)
-                logits = fp8_mqa_logits(
+                logits = fp8_fp4_mqa_logits(
                     q_fp8, kv_fp8, weights, ks, ke, clean_logits=clean_logits
                 )
 
