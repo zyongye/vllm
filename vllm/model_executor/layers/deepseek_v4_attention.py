@@ -4,6 +4,8 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import math
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -51,6 +53,7 @@ from vllm.model_executor.layers.quantization.input_quant_fp8 import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
 )
+from vllm.platforms import current_platform
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
@@ -193,8 +196,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Pick fp8_einsum recipe based on GPU arch:
         # SM90: FP32 block scales stay [g, r/128, d/128] → sfb_gran_mn=128
         # SM100: INT32 packed scales become [g, r, ...] → sfb_gran_mn=1
-        from vllm.platforms import current_platform
-
         cap = current_platform.get_device_capability()
         self._einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
         self._tma_aligned_scales = cap.major >= 10
@@ -487,7 +488,78 @@ def deepseek_v4_fp8_einsum(
     equation: str,
     recipe: list[int],
 ) -> None:
-    fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
+    try:
+        fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
+    except RuntimeError as exc:
+        if "DeepGEMM backend is not available or outdated" not in str(exc):
+            raise
+        _deepseek_v4_fp8_einsum_fallback(a, a_scale, b, b_scale, out, equation)
+
+
+def _decode_e8m0_scales(scale: torch.Tensor) -> torch.Tensor:
+    if scale.dtype == torch.float8_e8m0fnu:
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            _upcast_e8m0_to_fp32,
+        )
+
+        return _upcast_e8m0_to_fp32(scale).contiguous()
+    return scale.to(torch.float32)
+
+
+def _expand_last_dim_scales(scale: torch.Tensor, last_dim: int) -> torch.Tensor:
+    scale = _decode_e8m0_scales(scale)
+    block = math.ceil(last_dim / scale.shape[-1])
+    return torch.repeat_interleave(scale, block, dim=-1)[..., :last_dim]
+
+
+def _expand_2d_block_scales(
+    scale: torch.Tensor,
+    rows: int,
+    cols: int,
+) -> torch.Tensor:
+    scale = _decode_e8m0_scales(scale)
+    row_blocks, col_blocks = scale.shape[-2:]
+    row_block = math.ceil(rows / row_blocks)
+    col_block = math.ceil(cols / col_blocks)
+    scale = torch.repeat_interleave(scale, row_block, dim=-2)[..., :rows, :]
+    scale = torch.repeat_interleave(scale, col_block, dim=-1)[..., :, :cols]
+    return scale
+
+
+def _deepseek_v4_fp8_einsum_fallback(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: torch.Tensor,
+    equation: str,
+) -> None:
+    if equation != "bhr,hdr->bhd":
+        raise RuntimeError(f"Unsupported fallback equation: {equation}")
+
+    num_groups = a.shape[1]
+    hidden_dim = a.shape[2]
+    output_dim = b.shape[0] // num_groups
+
+    if b.shape[0] % num_groups != 0:
+        raise RuntimeError(
+            f"Cannot reshape weight of shape {tuple(b.shape)} into "
+            f"({num_groups}, {output_dim}, {hidden_dim})."
+        )
+
+    a_deq = (a.to(torch.float32) * _expand_last_dim_scales(a_scale, hidden_dim)).to(
+        torch.bfloat16
+    )
+
+    b_deq = b.view(num_groups, output_dim, hidden_dim).to(torch.float32)
+    b_scale_deq = _expand_2d_block_scales(
+        b_scale.view(num_groups, -1, b_scale.shape[-1]),
+        output_dim,
+        hidden_dim,
+    )
+    b_deq = (b_deq * b_scale_deq).to(torch.bfloat16)
+
+    out.copy_(torch.einsum(equation, a_deq, b_deq).to(out.dtype))
 
 
 def deepseek_v4_fp8_einsum_fake(
@@ -584,8 +656,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             vllm_config.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
-        # DeepseekV4 only supports fp8 kv-cache format for now
+        # DeepseekV4 only supports fp8 kv-cache format for now. Treat "auto"
+        # as the model default and normalize it before the fp8-only checks.
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
+        if kv_cache_dtype == "auto":
+            kv_cache_dtype = "fp8"
 
         assert kv_cache_dtype.startswith("fp8"), (
             f"DeepseekV4 only supports fp8 kv-cache format for now, "
@@ -728,6 +803,20 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
+
+        if current_platform.is_rocm():
+            self._forward_decode_fallback(
+                q=q,
+                kv_cache=kv_cache,
+                swa_metadata=swa_metadata,
+                swa_only=swa_only,
+                topk_indices=topk_indices,
+                topk_lens=topk_lens,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                output=output,
+            )
+            return
 
         # We treat queries in the same seq as different queries
         # and later we only attend by generated indices.
@@ -889,15 +978,154 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 N,
             )
 
-            output_chunk, _, _ = flash_mla_sparse_fwd(
-                q=q[query_start:query_end],
-                kv=kv.view(-1, 1, q.shape[-1]),
-                indices=combined_indices.unsqueeze(1),
-                sm_scale=self.scale,
-                attn_sink=self.attn_sink,
-                topk_length=combined_lens,
-                out=output[query_start:query_end],
+            if current_platform.is_rocm():
+                from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
+                    reference_mla_sparse_prefill,
+                )
+
+                output_chunk, _ = reference_mla_sparse_prefill(
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices.unsqueeze(1),
+                    sm_scale=self.scale,
+                    d_v=self.head_dim,
+                )
+                output[query_start:query_end].copy_(output_chunk.to(output.dtype))
+            else:
+                output_chunk, _, _ = flash_mla_sparse_fwd(
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices.unsqueeze(1),
+                    sm_scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    topk_length=combined_lens,
+                    out=output[query_start:query_end],
+                )
+
+    def _decode_e8m0_scales(self, scale: torch.Tensor) -> torch.Tensor:
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            _upcast_e8m0_to_fp32,
+        )
+
+        return _upcast_e8m0_to_fp32(scale.contiguous())
+
+    def _dequantize_cache_rows(self, rows: torch.Tensor) -> torch.Tensor:
+        rows = rows.reshape(-1, rows.shape[-1])
+        fp8_dtype = current_platform.fp8_dtype()
+        fp8_dim = self.nope_head_dim
+        rope_bytes = self.rope_head_dim * 2
+        scale_dim = fp8_dim // 64
+
+        fp8_vals = rows[:, :fp8_dim].contiguous().view(fp8_dtype)
+        rope_vals = rows[:, fp8_dim : fp8_dim + rope_bytes].contiguous().view(
+            torch.bfloat16
+        )
+        scale_bytes = rows[
+            :, fp8_dim + rope_bytes : fp8_dim + rope_bytes + scale_dim
+        ].contiguous()
+        scales = self._decode_e8m0_scales(scale_bytes)
+        scales = torch.repeat_interleave(scales, 64, dim=-1)
+        nope = fp8_vals.to(torch.float32) * scales
+        return torch.cat([nope, rope_vals.to(torch.float32)], dim=-1).to(torch.bfloat16)
+
+    def _gather_dequantized_cache_tokens(
+        self,
+        cache: torch.Tensor,
+        slot_ids: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        if slot_ids.numel() == 0:
+            return torch.empty((0, self.head_dim), dtype=torch.bfloat16, device=cache.device)
+        slot_ids = slot_ids.to(torch.int64)
+        rows = cache[slot_ids // block_size, slot_ids % block_size]
+        return self._dequantize_cache_rows(rows).reshape(-1, self.head_dim)
+
+    def _forward_decode_fallback(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor | None,
+        swa_metadata: "DeepseekSparseSWAMetadata",
+        swa_only: bool,
+        topk_indices: torch.Tensor | None,
+        topk_lens: torch.Tensor | None,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
+            reference_mla_sparse_prefill,
+        )
+
+        num_decode_tokens = q.shape[0]
+        token_kvs: list[torch.Tensor] = []
+        max_len = 0
+        compressed_block_size = 0 if swa_only else int(kv_cache.shape[1])
+        for token_idx in range(num_decode_tokens):
+            token_chunks: list[torch.Tensor] = []
+            if not swa_only:
+                assert kv_cache is not None and topk_indices is not None and topk_lens is not None
+                topk_len = int(topk_lens[token_idx].item())
+                if topk_len > 0:
+                    token_chunks.append(
+                        self._gather_dequantized_cache_tokens(
+                            kv_cache,
+                            topk_indices[token_idx, 0, :topk_len],
+                            compressed_block_size,
+                        )
+                    )
+            swa_len = int(swa_lens[token_idx].item())
+            if swa_len > 0:
+                token_chunks.append(
+                    self._gather_dequantized_cache_tokens(
+                        self.swa_cache_layer.kv_cache,
+                        swa_indices[token_idx, :swa_len],
+                        int(swa_metadata.block_size),
+                    )
+                )
+            token_kv = (
+                torch.cat(token_chunks, dim=0)
+                if token_chunks
+                else torch.empty((0, self.head_dim), dtype=torch.bfloat16, device=q.device)
             )
+            token_kv = token_kv.reshape(-1, self.head_dim)
+            token_kvs.append(token_kv)
+            max_len = max(max_len, token_kv.shape[0])
+
+        total_len = sum(token_kv.shape[0] for token_kv in token_kvs)
+        if max_len == 0 or total_len == 0:
+            output.zero_()
+            return
+
+        gathered_kv = torch.empty(
+            (total_len, 1, self.head_dim), dtype=torch.bfloat16, device=q.device
+        )
+        gathered_indices = torch.full(
+            (num_decode_tokens, 1, max_len),
+            -1,
+            dtype=torch.int32,
+            device=q.device,
+        )
+
+        cursor = 0
+        for token_idx, token_kv in enumerate(token_kvs):
+            token_len = token_kv.shape[0]
+            if token_len == 0:
+                continue
+
+            gathered_kv[cursor : cursor + token_len, 0].copy_(token_kv)
+            gathered_indices[token_idx, 0, :token_len] = torch.arange(
+                cursor, cursor + token_len, dtype=torch.int32, device=q.device
+            )
+            cursor += token_len
+
+        attn_out, _ = reference_mla_sparse_prefill(
+            q=q,
+            kv=gathered_kv[:cursor],
+            indices=gathered_indices,
+            sm_scale=self.scale,
+            d_v=self.head_dim,
+        )
+        output.copy_(attn_out.to(output.dtype))
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
