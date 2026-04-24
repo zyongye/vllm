@@ -4,6 +4,8 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import os
+
 import math
 
 from dataclasses import dataclass
@@ -44,7 +46,11 @@ from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.model_executor.layers.deepseek_compressor import DeepseekCompressor
+from vllm.model_executor.layers.deepseek_compressor import (
+    DeepseekCompressor,
+    apply_gptj_rope_ref,
+    hadamard_transform_ref,
+)
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.input_quant_fp8 import (
@@ -265,7 +271,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 compress_ratio=self.compress_ratio,
                 hidden_size=self.hidden_size,
                 head_dim=self.head_dim,
-                rotate=True,
+                rotate=False,
                 prefix=f"{prefix}.compressor",
                 k_cache_prefix=self.mla_attn.prefix,
             )
@@ -298,6 +304,30 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.layer_name,
         )
         o = o_padded[:, : self.n_local_heads, :]
+
+        if os.getenv("VLLM_DSV4_WO_A_REF", "0") == "1":
+            o_ref = _apply_gptj_inv_rope_ref(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.rope_head_dim,
+            ).to(torch.bfloat16)
+            o_ref = o_ref.view(num_tokens, self.n_local_groups, -1)
+
+            hidden_dim = o_ref.shape[-1]
+            wo_a_deq = self.wo_a.weight.view(
+                self.n_local_groups, self.o_lora_rank, hidden_dim
+            ).to(torch.float32)
+            wo_a_scale = _expand_2d_block_scales(
+                self.wo_a.weight_scale_inv.view(
+                    self.n_local_groups, -1, self.wo_a.weight_scale_inv.shape[-1]
+                ),
+                self.o_lora_rank,
+                hidden_dim,
+            )
+            wo_a_deq = (wo_a_deq * wo_a_scale).to(torch.bfloat16)
+            z = torch.einsum("tgd,grd->tgr", o_ref, wo_a_deq)
+            return self.wo_b(z.flatten(1))
 
         # O projection: inverse RoPE + FP8 quant + einsum + wo_b
         o_fp8, o_scale = fused_inv_rope_fp8_quant(
@@ -488,6 +518,9 @@ def deepseek_v4_fp8_einsum(
     equation: str,
     recipe: list[int],
 ) -> None:
+    if os.getenv("VLLM_DSV4_FORCE_FP8_EINSUM_FALLBACK", "0") == "1":
+        _deepseek_v4_fp8_einsum_fallback(a, a_scale, b, b_scale, out, equation)
+        return
     try:
         fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
     except RuntimeError as exc:
@@ -524,6 +557,36 @@ def _expand_2d_block_scales(
     scale = torch.repeat_interleave(scale, row_block, dim=-2)[..., :rows, :]
     scale = torch.repeat_interleave(scale, col_block, dim=-1)[..., :, :cols]
     return scale
+
+
+def _apply_gptj_inv_rope_ref(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    rope_dim: int,
+) -> torch.Tensor:
+    if rope_dim == 0 or x.numel() == 0:
+        return x
+    half_rot = rope_dim // 2
+    nope_dim = x.shape[-1] - rope_dim
+    dtype = x.dtype
+    x = x.to(torch.float32)
+    cache = cos_sin_cache.index_select(0, positions.to(torch.long))
+    cos = cache[:, :half_rot].to(torch.float32)
+    sin = cache[:, half_rot : 2 * half_rot].to(torch.float32)
+    view_shape = (positions.shape[0],) + (1,) * (x.dim() - 2) + (half_rot,)
+    cos = cos.view(view_shape)
+    sin = sin.view(view_shape)
+    rope = x[..., nope_dim:]
+    y_even = rope[..., 0::2]
+    y_odd = rope[..., 1::2]
+    rope_out = torch.stack(
+        (y_even * cos + y_odd * sin, y_odd * cos - y_even * sin),
+        dim=-1,
+    ).flatten(-2)
+    x = x.clone()
+    x[..., nope_dim:] = rope_out
+    return x.to(dtype)
 
 
 def _deepseek_v4_fp8_einsum_fallback(
@@ -979,16 +1042,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
 
             if current_platform.is_rocm():
-                from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
-                    reference_mla_sparse_prefill,
-                )
-
-                output_chunk, _ = reference_mla_sparse_prefill(
+                output_chunk = self._ref_sparse_attn_prefill(
                     q=q[query_start:query_end],
                     kv=kv.view(-1, 1, q.shape[-1]),
                     indices=combined_indices.unsqueeze(1),
-                    sm_scale=self.scale,
-                    d_v=self.head_dim,
+                    topk_length=combined_lens,
                 )
                 output[query_start:query_end].copy_(output_chunk.to(output.dtype))
             else:
@@ -1052,80 +1110,165 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_lens: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
-            reference_mla_sparse_prefill,
-        )
-
-        num_decode_tokens = q.shape[0]
-        token_kvs: list[torch.Tensor] = []
-        max_len = 0
-        compressed_block_size = 0 if swa_only else int(kv_cache.shape[1])
-        for token_idx in range(num_decode_tokens):
-            token_chunks: list[torch.Tensor] = []
-            if not swa_only:
-                assert kv_cache is not None and topk_indices is not None and topk_lens is not None
-                topk_len = int(topk_lens[token_idx].item())
-                if topk_len > 0:
-                    token_chunks.append(
-                        self._gather_dequantized_cache_tokens(
-                            kv_cache,
-                            topk_indices[token_idx, 0, :topk_len],
-                            compressed_block_size,
-                        )
-                    )
-            swa_len = int(swa_lens[token_idx].item())
-            if swa_len > 0:
-                token_chunks.append(
-                    self._gather_dequantized_cache_tokens(
-                        self.swa_cache_layer.kv_cache,
-                        swa_indices[token_idx, :swa_len],
-                        int(swa_metadata.block_size),
-                    )
-                )
-            token_kv = (
-                torch.cat(token_chunks, dim=0)
-                if token_chunks
-                else torch.empty((0, self.head_dim), dtype=torch.bfloat16, device=q.device)
-            )
-            token_kv = token_kv.reshape(-1, self.head_dim)
-            token_kvs.append(token_kv)
-            max_len = max(max_len, token_kv.shape[0])
-
-        total_len = sum(token_kv.shape[0] for token_kv in token_kvs)
-        if max_len == 0 or total_len == 0:
-            output.zero_()
-            return
-
-        gathered_kv = torch.empty(
-            (total_len, 1, self.head_dim), dtype=torch.bfloat16, device=q.device
-        )
-        gathered_indices = torch.full(
-            (num_decode_tokens, 1, max_len),
-            -1,
-            dtype=torch.int32,
-            device=q.device,
-        )
-
-        cursor = 0
-        for token_idx, token_kv in enumerate(token_kvs):
-            token_len = token_kv.shape[0]
-            if token_len == 0:
-                continue
-
-            gathered_kv[cursor : cursor + token_len, 0].copy_(token_kv)
-            gathered_indices[token_idx, 0, :token_len] = torch.arange(
-                cursor, cursor + token_len, dtype=torch.int32, device=q.device
-            )
-            cursor += token_len
-
-        attn_out, _ = reference_mla_sparse_prefill(
-            q=q,
-            kv=gathered_kv[:cursor],
-            indices=gathered_indices,
-            sm_scale=self.scale,
-            d_v=self.head_dim,
+        blocked_swa = self._dequantize_blocked_k_cache(self.swa_cache_layer.kv_cache)
+        blocked_extra = None if swa_only else self._dequantize_blocked_k_cache(kv_cache)
+        attn_out = self._ref_sparse_attn_decode(
+            q=q.unsqueeze(1),
+            blocked_k=blocked_swa,
+            indices_in_kvcache=swa_indices.unsqueeze(1),
+            topk_length=swa_lens,
+            attn_sink=self.attn_sink[: q.shape[1]],
+            extra_blocked_k=blocked_extra,
+            extra_indices_in_kvcache=topk_indices,
+            extra_topk_length=topk_lens,
         )
         output.copy_(attn_out.to(output.dtype))
+
+    def _dequantize_blocked_k_cache(self, quant_k_cache: torch.Tensor) -> torch.Tensor:
+        fp8_dtype = current_platform.fp8_dtype()
+        d = self.head_dim
+        d_nope = self.nope_head_dim
+        d_rope = self.rope_head_dim
+        tile_size = 64
+        num_tiles = d_nope // tile_size
+
+        num_blocks, block_size, _ = quant_k_cache.shape
+        quant_k_cache = quant_k_cache.view(num_blocks, -1)
+        input_nope_rope = quant_k_cache[:, : block_size * (d_nope + 2 * d_rope)].view(
+            num_blocks, block_size, d_nope + 2 * d_rope
+        )
+        input_nope = input_nope_rope[:, :, :d_nope].view(fp8_dtype)
+        input_rope = input_nope_rope[:, :, d_nope:].view(torch.bfloat16)
+        input_scale = (
+            quant_k_cache[:, block_size * (d_nope + 2 * d_rope) :]
+            .view(num_blocks, block_size, 8)[:, :, :num_tiles]
+            .view(torch.float8_e8m0fnu)
+        )
+
+        result = torch.empty(
+            (num_blocks, block_size, 1, d),
+            dtype=torch.bfloat16,
+            device=quant_k_cache.device,
+        )
+        result[..., d_nope:] = input_rope.unsqueeze(2)
+        for tile_idx in range(num_tiles):
+            cur_nope = input_nope[
+                ..., tile_idx * tile_size : (tile_idx + 1) * tile_size
+            ].to(torch.bfloat16)
+            cur_scales = input_scale[:, :, tile_idx].to(torch.bfloat16).unsqueeze(-1)
+            result[
+                ..., tile_idx * tile_size : (tile_idx + 1) * tile_size
+            ] = (cur_nope * cur_scales).unsqueeze(2)
+        return result
+
+    def _ref_sparse_attn_prefill(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: torch.Tensor | None,
+    ) -> torch.Tensor:
+        indices = indices.clone().squeeze(1)
+        s_q, h_q, d_qk = q.shape
+        topk = indices.shape[-1]
+        s_kv = kv.shape[0]
+        if topk_length is not None:
+            mask = torch.arange(topk, device=indices.device).unsqueeze(0) >= topk_length.unsqueeze(1)
+            indices[mask] = -1
+        invalid_mask = (indices < 0) | (indices >= s_kv)
+        indices[invalid_mask] = 0
+
+        qf = q.float()
+        gathered_kv = (
+            kv.index_select(0, indices.flatten()).reshape(s_q, topk, d_qk).float()
+        )
+        scores = qf @ gathered_kv.transpose(1, 2)
+        scores *= self.scale
+        scores[invalid_mask.unsqueeze(1).expand_as(scores)] = float("-inf")
+
+        orig_lse = torch.logsumexp(scores, dim=-1)
+        lse_for_o = orig_lse
+        if self.attn_sink is not None:
+            lse_for_o = torch.logsumexp(
+                torch.stack([orig_lse, self.attn_sink[:h_q].view(1, h_q).expand_as(orig_lse)], dim=0),
+                dim=0,
+            )
+        lse_for_o = lse_for_o.clone()
+        lse_for_o[lse_for_o == float("-inf")] = float("+inf")
+        probs = torch.exp(scores - lse_for_o.unsqueeze(-1))
+        out = probs @ gathered_kv[..., : self.head_dim]
+        lonely_q_mask = orig_lse == float("-inf")
+        out[lonely_q_mask.unsqueeze(-1).expand_as(out)] = 0.0
+        return out.to(torch.bfloat16)
+
+    def _ref_sparse_attn_decode(
+        self,
+        q: torch.Tensor,
+        blocked_k: torch.Tensor,
+        indices_in_kvcache: torch.Tensor,
+        topk_length: torch.Tensor | None,
+        attn_sink: torch.Tensor | None,
+        extra_blocked_k: torch.Tensor | None = None,
+        extra_indices_in_kvcache: torch.Tensor | None = None,
+        extra_topk_length: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        b, s_q, h_q, d_qk = q.shape
+        d_v = self.head_dim
+
+        def process_scope(
+            cur_blocked_k: torch.Tensor,
+            cur_indices: torch.Tensor,
+            cur_topk_length: torch.Tensor | None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            cur_indices = cur_indices.reshape(b, s_q, -1)
+            topk = cur_indices.size(-1)
+            fixed_indices = torch.clamp_min(cur_indices, 0)
+            gathered_kv = (
+                cur_blocked_k.view(-1, d_qk)
+                .index_select(0, fixed_indices.view(-1))
+                .view(b, s_q, topk, d_qk)
+            )
+            invalid_mask = cur_indices == -1
+            if cur_topk_length is not None:
+                cur_topk_length = cur_topk_length.reshape(b)
+                invalid_mask |= torch.arange(0, topk, device=invalid_mask.device).view(
+                    1, 1, topk
+                ) >= cur_topk_length.view(b, 1, 1)
+            return gathered_kv, invalid_mask
+
+        gathered_kv, invalid_mask = process_scope(
+            blocked_k, indices_in_kvcache, topk_length
+        )
+        if extra_blocked_k is not None:
+            assert extra_indices_in_kvcache is not None
+            gathered_kv1, invalid_mask1 = process_scope(
+                extra_blocked_k, extra_indices_in_kvcache, extra_topk_length
+            )
+            gathered_kv = torch.cat([gathered_kv, gathered_kv1], dim=2)
+            invalid_mask = torch.cat([invalid_mask, invalid_mask1], dim=2)
+
+        gathered_kv = gathered_kv.view(b * s_q, -1, d_qk).float()
+        gathered_kv[gathered_kv != gathered_kv] = 0.0
+        qf = q.float().view(b * s_q, h_q, d_qk)
+        attn_weight = qf @ gathered_kv.transpose(-1, -2)
+        attn_weight *= self.scale
+        attn_weight[
+            invalid_mask.view(b * s_q, 1, -1).expand(b * s_q, h_q, invalid_mask.size(-1))
+        ] = float("-inf")
+        lse = attn_weight.logsumexp(dim=-1)
+        attn_weight = torch.exp(attn_weight - lse.unsqueeze(-1))
+        output = attn_weight @ gathered_kv[..., :d_v]
+        output = output.view(b, s_q, h_q, d_v)
+        lse = lse.view(b, s_q, h_q)
+
+        if attn_sink is not None:
+            output *= (
+                1.0 / (1.0 + torch.exp(attn_sink.view(1, 1, h_q) - lse))
+            ).unsqueeze(-1)
+
+        lonely_q_mask = lse == float("-inf")
+        output[lonely_q_mask.unsqueeze(-1).expand_as(output)] = 0.0
+        return output.squeeze(1).to(torch.bfloat16)
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
@@ -1278,13 +1421,40 @@ class DeepseekV4Indexer(nn.Module):
         q = q.view(-1, self.n_head, self.head_dim)
         k = self.compressor(hidden_states, positions, rotary_emb)
         weights, _ = self.weights_proj(hidden_states)
-        q_quant, weights = fused_indexer_q_rope_quant(
-            positions,
-            q,
-            rotary_emb.cos_sin_cache,
-            weights,
-            self.softmax_scale,
-            self.n_head**-0.5,
-            use_fp4=self.use_fp4_kv,
-        )
+        if current_platform.is_rocm() and not self.use_fp4_kv:
+            q_quant, weights = self._quantize_indexer_q_torch(
+                q, positions, rotary_emb.cos_sin_cache, weights
+            )
+        else:
+            q_quant, weights = fused_indexer_q_rope_quant(
+                positions,
+                q,
+                rotary_emb.cos_sin_cache,
+                weights,
+                self.softmax_scale,
+                self.n_head**-0.5,
+                use_fp4=self.use_fp4_kv,
+            )
         return self.indexer_op(hidden_states, q_quant, k, weights)
+
+    def _quantize_indexer_q_torch(
+        self,
+        q: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q = apply_gptj_rope_ref(q, positions, cos_sin_cache, self.rope_dim).to(
+            torch.bfloat16
+        )
+        q = hadamard_transform_ref(q).to(torch.float32)
+        fp8_max = 224.0 if current_platform.is_fp8_fnuz() else 448.0
+        q_scale = torch.abs(q).amax(dim=-1).clamp(min=1e-12) / fp8_max
+        q_quant = (q / q_scale.unsqueeze(-1)).to(current_platform.fp8_dtype())
+        weights = (
+            weights.to(torch.float32)
+            * q_scale
+            * self.softmax_scale
+            * (self.n_head**-0.5)
+        )
+        return q_quant, weights

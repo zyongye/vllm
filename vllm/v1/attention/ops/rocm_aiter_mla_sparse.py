@@ -5,6 +5,7 @@ import importlib
 from importlib.util import find_spec
 
 import torch
+import torch.nn.functional as F
 
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
@@ -232,6 +233,39 @@ def fp8_paged_mqa_logits_torch(
 
     fp8_dtype = current_platform.fp8_dtype()
     batch_size, next_n, _, dim = q.size()
+    if next_n == 1:
+        block_size = kv_cache.shape[1]
+        logits = torch.full(
+            [batch_size, max_model_len],
+            float("-inf"),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        if context_lens.dim > 1:
+            context_lens = context_lens.squeeze(-1)
+        kv_cache_flat = kv_cache.view(-1, block_size * (dim + 4))
+        for i in range(batch_size):
+            q_i = q[i, 0].to(torch.float32)
+            q_scale = weights[i]
+            seq_len = int(context_lens[i].item())
+            assert seq_len <= max_model_len
+            num_pages = cdiv(seq_len, block_size)
+            padded_seq_len = num_pages * block_size
+            pages = block_tables[i, :num_pages]
+            cache = kv_cache_flat[pages]
+            scale_offset = block_size * dim
+            cache_value = cache[..., :scale_offset].view(dtype=fp8_dtype).to(torch.float32)
+            cache_scale = cache[..., scale_offset:].view(dtype=torch.float32).contiguous()
+            cache_value = cache_value.view(padded_seq_len, dim)
+            cache_scale = cache_scale.view(padded_seq_len)
+            score = F.linear(cache_value, q_i)
+            score = F.relu(score)
+            score *= q_scale[None, :]
+            score = score.sum(dim=1)
+            score *= cache_scale
+            logits[i, :seq_len] = score[:seq_len]
+        return logits
+
     kv_cache, scale = kv_cache[..., :dim], kv_cache[..., dim:]
     scale = scale.contiguous().view(torch.float)
     q = q.float()
@@ -470,7 +504,13 @@ def rocm_fp8_mqa_logits(
 
 def _topk_indices_torch(logits: torch.Tensor, topk_tokens: int) -> torch.Tensor:
     k = min(topk_tokens, logits.shape[-1])
-    indices = torch.topk(logits, k=k, dim=-1).indices.to(torch.int32)
+    values, indices = torch.topk(logits, k=k, dim=-1)
+    indices = indices.to(torch.int32)
+    indices = torch.where(
+        values == float("-inf"),
+        torch.full_like(indices, -1, dtype=torch.int32),
+        indices,
+    )
     if k == topk_tokens:
         return indices
     padded = torch.full(

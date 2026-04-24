@@ -55,8 +55,8 @@ from .utils import (
 )
 
 
-SKIP_DEEPSEEK_V4_MOE = True
-SKIP_DEEPSEEK_V4_MHC = True
+SKIP_DEEPSEEK_V4_MOE = False
+SKIP_DEEPSEEK_V4_MHC = False
 
 
 class DeepseekV4MoEBypass(nn.Module):
