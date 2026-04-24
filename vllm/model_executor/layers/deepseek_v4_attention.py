@@ -19,7 +19,6 @@ from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.utils.deep_gemm import fp8_einsum
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.deepseek_v4_ops import (
-    MXFP4_BLOCK_SIZE,
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
@@ -1003,14 +1002,12 @@ class DeepseekV4Indexer(nn.Module):
             get_max_prefill_buffer_size(vllm_config) // self.compress_ratio
         )
 
-        # Per-token bytes, segregated [values | scales] per block:
-        #   FP8  : 128 + 4 = 132.   MXFP4: 64 + 4 = 68.
-        if self.use_fp4_kv:
-            k_cache_head_dim = self.head_dim // 2 + self.head_dim // MXFP4_BLOCK_SIZE
-        else:
-            k_cache_head_dim = (
-                self.head_dim + self.head_dim // self.quant_block_size * 4
-            )
+        assert cache_config is not None, "Deepseek V4 indexer requires cache_config"
+        # NOTE(yifan): FP8 indxer cache use the same layout as V3.2:
+        # head_dim bytes = 128 fp8 + 4 fp32 scale = 132.
+        # For FP4 indexer cache, we still allocate the same amount of memory as FP8,
+        # but only use the first half of the memory.
+        k_cache_head_dim = self.head_dim + self.head_dim // self.quant_block_size * 4
         self.k_cache = DeepseekV4IndexerCache(
             head_dim=k_cache_head_dim,
             dtype=torch.uint8,
