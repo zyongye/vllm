@@ -161,13 +161,16 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
   TORCH_CHECK(lengths.numel() == num_rows, "lengths size mismatch");
   TORCH_CHECK(output.size(0) == num_rows && output.size(1) == k,
               "output size mismatch");
-  TORCH_CHECK(k == 512 || k == 2048,
-              "persistent_topk supports k=512 or k=2048, got k=", k);
+  TORCH_CHECK(k == 512 || k == 1024 || k == 2048,
+              "persistent_topk supports k=512, k=1024, or k=2048, got k=", k);
   TORCH_CHECK(k <= stride, "k out of range");
 
   if (k == 512) {
     launch_persistent_topk<512>(logits, lengths, output, workspace,
                                 max_seq_len);
+  } else if (k == 1024) {
+    launch_persistent_topk<1024>(logits, lengths, output, workspace,
+                                 max_seq_len);
   } else {
     launch_persistent_topk<2048>(logits, lengths, output, workspace,
                                  max_seq_len);
