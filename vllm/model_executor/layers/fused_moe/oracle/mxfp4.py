@@ -472,8 +472,22 @@ def select_mxfp4_moe_backend(
             activation_format,
         )
 
+    # DeepSeek-V4 on ROCm is more accurate with the unfused Triton MXFP4 path
+    # than the default AITER path. Prefer Triton-unfused for this routing mode,
+    # while keeping AITER as a fallback if Triton-unfused rejects the config.
+    if (
+        current_platform.is_rocm()
+        and config.routing_method == RoutingMethodType.DeepseekV4
+    ):
+        priority_backends = [
+            Mxfp4MoeBackend.TRITON_UNFUSED,
+            Mxfp4MoeBackend.AITER,
+        ]
+    else:
+        priority_backends = _get_priority_backends()
+
     # Iterate priority backends: TRTLLM MXFP8, then Triton.
-    for backend in _get_priority_backends():
+    for backend in priority_backends:
         activation_key = _backend_activation_key(backend)
         for k_cls in backend_to_kernel_cls(backend):
             supported, reason = k_cls.is_supported_config(
