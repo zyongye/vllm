@@ -294,6 +294,56 @@ def test_indexer_quant_cache_roundtrip(num_tokens: int, block_size: int):
         )
 
 
+def test_indexer_gather_accepts_upper_bound_output():
+    """Gather only exact cu_seq_lens even when dst is over-allocated."""
+
+    head_dim = 128
+    quant_block_size = 128
+    cache_stride = head_dim + head_dim * 4 // quant_block_size
+    valid_tokens = 9
+    upper_bound_tokens = 13
+    block_size = 16
+    num_blocks = 2
+    sentinel = 123
+    device = "cuda"
+
+    k = torch.randn(valid_tokens, head_dim, dtype=torch.bfloat16, device=device)
+    kv_cache = torch.zeros(
+        num_blocks, block_size, cache_stride, dtype=torch.uint8, device=device
+    )
+    slot_mapping = torch.arange(valid_tokens, dtype=torch.int64, device=device)
+    ops.indexer_k_quant_and_cache(k, kv_cache, slot_mapping, quant_block_size, "ue8m0")
+
+    block_table = torch.arange(num_blocks, dtype=torch.int32, device=device).unsqueeze(
+        0
+    )
+    cu_seq_lens = torch.tensor([0, valid_tokens], dtype=torch.int32, device=device)
+    dst_k = torch.full(
+        (upper_bound_tokens, head_dim), sentinel, dtype=torch.uint8, device=device
+    )
+    num_scale_bytes = head_dim * 4 // quant_block_size
+    dst_scale = torch.full(
+        (upper_bound_tokens, num_scale_bytes),
+        sentinel,
+        dtype=torch.uint8,
+        device=device,
+    )
+
+    ops.cp_gather_indexer_k_quant_cache(
+        kv_cache, dst_k, dst_scale, block_table, cu_seq_lens
+    )
+    torch.accelerator.synchronize()
+
+    k_recovered = dst_k[:valid_tokens].view(torch.float8_e4m3fn).float() * dst_scale[
+        :valid_tokens
+    ].view(torch.float32)
+    diff = (k_recovered - k.float()).abs()
+    max_allowed = (16.0 * dst_scale[:valid_tokens].view(torch.float32).max()).item()
+    assert diff.max().item() <= max_allowed
+    assert torch.all(dst_k[valid_tokens:] == sentinel)
+    assert torch.all(dst_scale[valid_tokens:] == sentinel)
+
+
 # ── Test C: DeepseekV4 attention with values at different magnitudes ───────────
 
 

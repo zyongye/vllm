@@ -447,8 +447,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         prefill_metadata = None
         if num_prefills > 0:
-            # Defer CPU mirror of seq_lens until we know prefill needs it.
-            seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+            # This CPU value is an upper bound for async-spec extend rows.  It
+            # is safe for chunking/allocation because CUDA metadata below is
+            # built from exact device seq_lens and gather ignores the tail.
+            assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
             compressed_seq_lens_cpu = (
                 seq_lens_cpu // self.compress_ratio
                 if self.compress_ratio > 1
