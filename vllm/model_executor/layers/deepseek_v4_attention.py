@@ -993,8 +993,9 @@ class DeepseekV4Indexer(nn.Module):
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
 
-        self.max_model_len = (
-            vllm_config.model_config.max_model_len // self.compress_ratio
+        self.max_model_len = max(
+            vllm_config.model_config.max_model_len // self.compress_ratio,
+            self.topk_tokens,
         )
         self.prefix = prefix
 
