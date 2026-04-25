@@ -374,8 +374,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
         elif self.compressor is not None:
             # Compressor on default, kv_insert on aux.
+            compressor = self.compressor
             maybe_execute_in_parallel(
-                lambda: self.compressor(hidden_states, positions, self.rotary_emb),
+                lambda: compressor(hidden_states, positions, self.rotary_emb),
                 lambda: self._fused_qnorm_rope_kv_insert(
                     q, kv, positions, attn_metadata
                 ),
