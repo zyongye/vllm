@@ -10,7 +10,7 @@ from vllm.utils.deep_gemm import (
     _ceil_to_ue8m0,
     calc_diff,
     fp8_fp4_mqa_logits,
-    fp8_paged_mqa_logits,
+    fp8_fp4_paged_mqa_logits,
     get_num_sms,
     get_paged_mqa_logits_metadata,
 )
@@ -150,7 +150,7 @@ def test_deepgemm_fp8_mqa_logits(clean_logits: bool):
                 assert diff < 1e-3, f"{diff=}"
 
 
-def _ref_fp8_paged_mqa_logits(
+def _ref_fp8_fp4_paged_mqa_logits(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     weights: torch.Tensor,
@@ -206,7 +206,7 @@ def _ref_fp8_paged_mqa_logits(
     not current_platform.has_device_capability(90), reason="SM90 and SM100 only"
 )
 @pytest.mark.parametrize("clean_logits", [True, False])
-def test_deepgemm_fp8_paged_mqa_logits(clean_logits: bool):
+def test_deepgemm_fp8_fp4_paged_mqa_logits(clean_logits: bool):
     torch.manual_seed(0)
     random.seed(0)
 
@@ -261,7 +261,7 @@ def test_deepgemm_fp8_paged_mqa_logits(clean_logits: bool):
                 schedule_metadata = get_paged_mqa_logits_metadata(
                     context_lens, blocksize, get_num_sms()
                 )
-                logits = fp8_paged_mqa_logits(
+                logits = fp8_fp4_paged_mqa_logits(
                     q_fp8,
                     kv_cache_fp8,
                     weights,
@@ -272,7 +272,7 @@ def test_deepgemm_fp8_paged_mqa_logits(clean_logits: bool):
                     clean_logits=clean_logits,
                 )
 
-                ref_logits = _ref_fp8_paged_mqa_logits(
+                ref_logits = _ref_fp8_fp4_paged_mqa_logits(
                     q,
                     kv_cache,
                     weights,

@@ -51,6 +51,7 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_storage_block_
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc_cpu,
         seq_lens=seq_lens,
+        seq_lens_cpu_upper_bound=seq_lens.cpu(),
         num_reqs=1,
         num_actual_tokens=40,
         max_query_len=40,
