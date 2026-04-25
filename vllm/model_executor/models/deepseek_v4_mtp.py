@@ -39,7 +39,11 @@ from vllm.utils.multi_stream_utils import AuxStreamType
 
 from .deepseek_mtp import SharedHead
 from .deepseek_v2 import get_spec_layer_idx_from_weight_name
-from .deepseek_v4 import DeepseekV4DecoderLayer, hc_head
+from .deepseek_v4 import (
+    DeepseekV4DecoderLayer,
+    hc_head,
+    make_deepseek_v4_expert_params_mapping,
+)
 from .utils import maybe_prefix
 
 logger = init_logger(__name__)
@@ -308,13 +312,19 @@ class DeepSeekV4MTP(nn.Module):
         head_rank_end = n_local_head * (tp_rank + 1)
 
         # Pre-compute expert mapping ONCE.
-        expert_mapping = FusedMoE.make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.n_routed_experts,
-        )
+        first_layer = next(iter(self.model.layers.values()))
+        if first_layer.mtp_block.ffn.use_mega_moe:
+            expert_mapping = make_deepseek_v4_expert_params_mapping(
+                self.config.n_routed_experts
+            )
+        else:
+            expert_mapping = FusedMoE.make_expert_params_mapping(
+                self,
+                ckpt_gate_proj_name="w1",
+                ckpt_down_proj_name="w2",
+                ckpt_up_proj_name="w3",
+                num_experts=self.config.n_routed_experts,
+            )
 
         for name, loaded_weight in weights:
             mtp_layer_idx = _find_mtp_layer_idx(name)
@@ -428,8 +438,13 @@ class DeepSeekV4MTP(nn.Module):
                     f"Use a checkpoint that includes MTP layer weights, "
                     f"or disable speculative decoding."
                 )
+        self.finalize_mega_moe_weights()
         logger.info_once("MTP draft model loaded: %d params", len(loaded_params))
         return loaded_params
+
+    def finalize_mega_moe_weights(self) -> None:
+        for layer in self.model.layers.values():
+            layer.mtp_block.ffn.finalize_mega_moe_weights()
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         """
