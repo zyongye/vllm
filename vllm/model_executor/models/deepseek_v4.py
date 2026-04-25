@@ -458,6 +458,16 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
             )
         )
+        # Drop the original loader-side parameters: the MegaMoE kernels only
+        # consume the transformed views above. transform_weights_for_mega_moe
+        # allocates a fresh tensor for the L1 weight (see _interleave_l1_weights)
+        # and fresh SF tensors for L1/L2; the L2 weight is the only tensor that
+        # aliases the original storage, and _transformed_l2_weights still holds
+        # it, so the storage stays live after we drop the Parameter.
+        self.w13_weight = None
+        self.w13_weight_scale = None
+        self.w2_weight = None
+        self.w2_weight_scale = None
 
     def get_symm_buffer(self):
         import vllm.third_party.deep_gemm as deep_gemm
@@ -534,6 +544,10 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             symm_buffer.topk_idx[:num_tokens],
             symm_buffer.topk_weights[:num_tokens],
         )
+
+        # This method must have been already called during the weight loading phase.
+        # We call it again here to cover the dummy weight loading case.
+        self.finalize_weights()
 
         assert self._transformed_l1_weights is not None
         assert self._transformed_l2_weights is not None
