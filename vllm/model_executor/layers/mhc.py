@@ -2,13 +2,27 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 from functools import cache
+from typing import TYPE_CHECKING
 
-import tilelang
-import tilelang.language as T
 import torch
 
+from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_tilelang
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
+
+# tilelang is only available on CUDA platforms
+if TYPE_CHECKING or current_platform.is_cuda_alike():
+    if not has_tilelang():
+        raise ImportError(
+            "tilelang is required for mhc but is not installed. Install it with "
+            "`pip install tilelang`."
+        )
+    import tilelang
+    import tilelang.language as T
+else:
+    tilelang = None  # type: ignore[assignment]
+    T = None  # type: ignore[assignment]
 
 
 @cache
