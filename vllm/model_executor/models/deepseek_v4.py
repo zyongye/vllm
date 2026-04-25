@@ -3,7 +3,6 @@
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
-
 import regex as re
 import torch
 import torch.nn as nn
@@ -53,6 +52,69 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+def _should_inline_dequant_wo_a() -> bool:
+    return current_platform.is_rocm()
+
+
+def _dequant_fp8_wo_a_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    assert weight.dtype == torch.float8_e4m3fn, (
+        f"expected fp8_e4m3fn wo_a weight, got {weight.dtype}"
+    )
+    assert scale.dtype == torch.float8_e8m0fnu, (
+        f"expected fp8_e8m0fnu wo_a scale, got {scale.dtype}"
+    )
+    assert weight.shape[0] % scale.shape[0] == 0
+    assert weight.shape[1] % scale.shape[1] == 0
+    block_n = weight.shape[0] // scale.shape[0]
+    block_k = weight.shape[1] // scale.shape[1]
+    weight_f32 = weight.float().view(scale.shape[0], block_n, scale.shape[1], block_k)
+    dequant = (weight_f32 * scale.float()[:, None, :, None]).reshape(weight.shape)
+    return dequant.to(torch.bfloat16)
+
+
+def _preprocess_wo_a_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    if not _should_inline_dequant_wo_a():
+        yield from weights
+        return
+
+    pending: dict[str, dict[str, str | torch.Tensor]] = {}
+    for name, loaded_weight in weights:
+        if name.endswith(".wo_a.weight"):
+            key = name[: -len(".weight")]
+            entry = pending.setdefault(key, {})
+            entry["weight_name"] = name
+            entry["weight"] = loaded_weight
+        elif name.endswith(".wo_a.scale"):
+            key = name[: -len(".scale")]
+            entry = pending.setdefault(key, {})
+            entry["scale_name"] = name
+            entry["scale"] = loaded_weight
+        else:
+            yield name, loaded_weight
+            continue
+
+        entry = pending[key]
+        if "weight" not in entry or "scale" not in entry:
+            continue
+
+        weight_name = typing.cast(str, entry["weight_name"])
+        weight = typing.cast(torch.Tensor, entry["weight"])
+        scale = typing.cast(torch.Tensor, entry["scale"])
+        del pending[key]
+
+        if weight.dtype == torch.bfloat16:
+            yield weight_name, weight
+        else:
+            yield weight_name, _dequant_fp8_wo_a_weight(weight, scale)
+
+    for entry in pending.values():
+        if "weight_name" in entry and "weight" in entry:
+            yield typing.cast(str, entry["weight_name"]), typing.cast(
+                torch.Tensor, entry["weight"]
+            )
 
 
 class DeepseekV4FP8Config(Fp8Config):
@@ -295,11 +357,12 @@ class DeepseekV4Attention(nn.Module):
         )
 
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
+        self.use_bf16_wo_a_path = _should_inline_dequant_wo_a()
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None if self.use_bf16_wo_a_path else quant_config,
             return_bias=False,
             prefix=f"{prefix}.wo_a",
         )
@@ -411,6 +474,7 @@ class DeepseekV4DecoderLayer(nn.Module):
     ):
         super().__init__()
         config = vllm_config.model_config.hf_config
+        self.layer_id = extract_layer_index(prefix)
         self.hidden_size = config.hidden_size
 
         self.rms_norm_eps = config.rms_norm_eps
@@ -843,7 +907,10 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(
+            _preprocess_wo_a_weights(weights),
+            mapper=self.hf_to_vllm_mapper,
+        )
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
