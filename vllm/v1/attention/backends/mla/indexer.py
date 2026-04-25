@@ -269,12 +269,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.reorder_batch_threshold += self.num_speculative_tokens
         # NOTE(zyongye) fp4 indexer cache only natively supports next_n in
         # natively_supported_next_n_fp4; for other next_n values we fall back
-        # to the flattening path. When fp4 indexer cache is disabled, the
-        # native (non-flattening) path handles all next_n values.
+        # to the flattening path. Outside the SM100 datacenter family the FP8
+        # paged MQA logits kernel has the same [1, 2] constraint (deepgemm
+        # smxx_fp8_fp4_paged_mqa_logits.hpp:233), so flatten there too.
         self.use_flattening = (
             self.use_fp4_indexer_cache
-            and next_n not in self.natively_supported_next_n_fp4
-        )
+            or not current_platform.is_device_capability_family(100)
+        ) and next_n not in self.natively_supported_next_n_fp4
 
         sm_count = num_compute_units(self.device.index)
         self.num_sms = sm_count
