@@ -4,8 +4,6 @@
 DeepseekV4 MLA Attention Layer
 """
 
-import os
-
 import math
 
 from dataclasses import dataclass
@@ -211,14 +209,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.topk_indices_buffer = mla_modules.topk_indices_buffer
 
         self.indexer = mla_modules.indexer
-        # sglang's ROCm path keeps wo_a in a BF16 reference matmul path.
-        # Match that behavior by default on ROCm to avoid drift from the
-        # fused FP8 O-projection path. Set VLLM_DSV4_WO_A_FP8=1 to A/B the
-        # original path while debugging.
-        self.use_ref_wo_a_path = (
-            current_platform.is_rocm()
-            and os.getenv("VLLM_DSV4_WO_A_FP8", "0") != "1"
-        )
+        # Keep ROCm on the BF16 reference wo_a path util kernel ready.
+        self.use_ref_wo_a_path = current_platform.is_rocm()
 
         # Per-head RMS normalization for Q (no learnable weights)
         self.q_head_norm = RMSNorm(head_dim, eps=self.eps, has_weight=False)
@@ -313,7 +305,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
         o = o_padded[:, : self.n_local_heads, :]
 
-        if self.use_ref_wo_a_path or os.getenv("VLLM_DSV4_WO_A_REF", "0") == "1":
+        if self.use_ref_wo_a_path:
             o_ref = _apply_inv_rope_ref(
                 self.rotary_emb, o, positions, self.rope_head_dim
             ).to(torch.bfloat16)
@@ -340,25 +332,16 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             return self.wo_b(z.flatten(1))
 
         # O projection: inverse RoPE + FP8 quant + einsum + wo_b
-        if os.getenv("VLLM_DSV4_INV_ROPE_QUANT_REF", "0") == "1":
-            o_ref = _apply_inv_rope_ref(
-                self.rotary_emb, o, positions, self.rope_head_dim
-            ).to(torch.bfloat16)
-            o_ref = o_ref.view(num_tokens * self.n_local_groups, -1).contiguous()
-            o_fp8, o_scale = self._wo_a_act_quant.forward_native(o_ref)
-            o_fp8 = o_fp8.view(num_tokens, self.n_local_groups, -1)
-            o_scale = o_scale.view(num_tokens, self.n_local_groups, -1)
-        else:
-            o_fp8, o_scale = fused_inv_rope_fp8_quant(
-                o,
-                positions,
-                self.rotary_emb.cos_sin_cache,
-                n_groups=self.n_local_groups,
-                heads_per_group=self.n_local_heads // self.n_local_groups,
-                nope_dim=self.nope_head_dim,
-                rope_dim=self.rope_head_dim,
-                tma_aligned_scales=self._tma_aligned_scales,
-            )
+        o_fp8, o_scale = fused_inv_rope_fp8_quant(
+            o,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            n_groups=self.n_local_groups,
+            heads_per_group=self.n_local_heads // self.n_local_groups,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
+            tma_aligned_scales=self._tma_aligned_scales,
+        )
 
         wo_a_fp8 = self.wo_a.weight
         wo_a_scale = self.wo_a.weight_scale_inv
@@ -537,9 +520,6 @@ def deepseek_v4_fp8_einsum(
     equation: str,
     recipe: list[int],
 ) -> None:
-    if os.getenv("VLLM_DSV4_FORCE_FP8_EINSUM_FALLBACK", "0") == "1":
-        _deepseek_v4_fp8_einsum_fallback(a, a_scale, b, b_scale, out, equation)
-        return
     try:
         fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
     except RuntimeError as exc:
