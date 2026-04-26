@@ -491,10 +491,12 @@ def test_raw_path_simple_shapes(seq_len):
 
 
 def test_raw_path_matches_paged_with_identity_table():
-    """Equivalence: fast_topk_v2_raw should produce the same output as
-    fast_topk_v2 with page_size=1 + identity page_table (the workaround
-    we previously used). This guarantees the raw path doesn't drift from
-    the paged one."""
+    """Cross-check: the kernel's two output modes (raw and paged) must
+    agree on the selected top-k set. With ``page_size=1`` and an identity
+    page_table, ``page_to_indices`` reduces to the identity, so
+    ``fast_topk_v2_raw`` and ``fast_topk_v2`` should pick the same indices.
+    Guards against the ``if constexpr (kRawOutput)`` branch in the kernel
+    drifting from the paged code path."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     B, seq_len = 8, 8192

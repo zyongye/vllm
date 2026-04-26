@@ -2,24 +2,25 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4 indexer top-k (k = 512), ported from sglang's topk_v2 family.
 
-The kernel is registered as ``torch.ops._C.fast_topk_v2`` (selection +
-fused page-table gather) and ``torch.ops._C.fast_topk_v2_plan`` (per-batch
-threshold and metadata). It is built for Hopper (sm_90a) and Blackwell
-datacenter (sm_100/sm_103); sm_120 (consumer Blackwell) is not supported
-because it lacks thread-block clusters.
+Three Python wrappers, all over the same underlying kernel:
 
-Two-step usage::
+- :func:`plan_topk_v2`     - run the plan kernel; produces per-batch metadata
+                              that the main kernel reads.
+- :func:`fast_topk_v2_raw` - select the top-512 columns per row, emit raw
+                              row-local indices (drop-in for persistent_topk).
+- :func:`fast_topk_v2`     - same selection + fold the page-table gather
+                              into the kernel's output store.
 
-    metadata = plan_topk_v2(seq_lens)
-    page_indices = fast_topk_v2(scores, seq_lens, page_table, page_size,
-                                metadata=metadata)
+Each main-kernel wrapper accepts an optional pre-allocated ``metadata``;
+when omitted, ``plan_topk_v2`` is invoked internally with a fresh tensor.
+Callers that want to amortize the plan kernel across multiple selections
+(e.g. across all indexer layers in a single forward) should plan once and
+pass the resulting metadata into every subsequent call.
 
-The plan can be amortized across same-shape forward calls (e.g. across all
-indexer layers within one cudagraph capture), since it depends only on
-``seq_lens``.
+Built for Hopper (sm_90a) and Blackwell datacenter (sm_100/sm_103); sm_120
+(consumer Blackwell) is not supported because it lacks thread-block
+clusters.
 """
-
-from typing import Optional
 
 import torch
 
@@ -29,12 +30,6 @@ _PLAN_COLS = 4
 
 # Output top-k size. Hardcoded in the kernel.
 _TOPK = 512
-
-# Hard upper bound on per-row seq_len. Mirrors kMaxSupportedLength in
-# csrc/deepseek_v4/fast_topk_v2.cu (= ClusterTopK::kMaxLength). For V4 C4A
-# with max_model_len <= 1M this is 256K compressed and stays inside this
-# bound.
-MAX_SUPPORTED_LEN: int = 262144
 
 _WORKSPACE_INTS_PER_BATCH: int | None = None
 
@@ -91,8 +86,8 @@ def fast_topk_v2_raw(
     seq_lens: torch.Tensor,
     *,
     metadata: torch.Tensor | None = None,
-    workspace: Optional[torch.Tensor] = None,
-    topk_indices: Optional[torch.Tensor] = None,
+    workspace: torch.Tensor | None = None,
+    topk_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Top-k only: select the top-512 indices per row, no page-table fold-in.
 
@@ -147,8 +142,8 @@ def fast_topk_v2(
     page_size: int,
     *,
     metadata: torch.Tensor | None = None,
-    workspace: Optional[torch.Tensor] = None,
-    page_indices: Optional[torch.Tensor] = None,
+    workspace: torch.Tensor | None = None,
+    page_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Select top-512 indexer scores per row and fold the page-table gather.
 

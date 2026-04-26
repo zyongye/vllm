@@ -8,7 +8,6 @@ from .cache_utils import (
     quantize_and_insert_k_cache,
 )
 from .fast_topk import (
-    MAX_SUPPORTED_LEN,
     fast_topk_v2,
     fast_topk_v2_raw,
     plan_topk_v2,
@@ -19,7 +18,6 @@ from .fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
 from .fused_qk_rmsnorm import fused_q_kv_rmsnorm
 
 __all__ = [
-    "MAX_SUPPORTED_LEN",
     "MXFP4_BLOCK_SIZE",
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
