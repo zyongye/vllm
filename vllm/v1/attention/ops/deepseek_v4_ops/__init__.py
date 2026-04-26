@@ -11,7 +11,6 @@ from .fast_topk import (
     MAX_SUPPORTED_LEN,
     fast_topk_v2,
     fast_topk_v2_raw,
-    allocate_fast_topk_v2_metadata_buffer,
     plan_topk_v2,
     workspace_ints_per_batch,
 )
@@ -30,7 +29,6 @@ __all__ = [
     "fused_indexer_q_rope_quant",
     "fused_inv_rope_fp8_quant",
     "fused_q_kv_rmsnorm",
-    "allocate_fast_topk_v2_metadata_buffer",
     "plan_topk_v2",
     "quantize_and_insert_k_cache",
     "workspace_ints_per_batch",
