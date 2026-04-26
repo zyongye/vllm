@@ -137,15 +137,18 @@ fused_add_rms_norm_static_fp8_quant_kernel(
     _f16Vec<scalar_t, width> res = residual_v[id];
     _f16Vec<scalar_t, width> w = weight_v[idx];
     using Converter = _typeConvert<scalar_t>;
+    using HipT = typename Converter::hip_type;
 #pragma unroll
     for (int i = 0; i < width; ++i) {
       float x = Converter::convert(res.data[i]);
       float wf = Converter::convert(w.data[i]);
       // See note in rms_norm_static_fp8_quant_kernel: round through scalar_t
-      // to match the unfused composite path at FP8 boundaries.
-      scalar_t out_norm = static_cast<scalar_t>(x * s_variance * wf);
+      // to match the unfused composite path at FP8 boundaries. We use the
+      // backend's hip_type for the intermediate since c10::Half/BFloat16 has
+      // ambiguous conversions on CUDA and no implicit conversion on ROCm.
+      HipT out_norm_h = Converter::convert(x * s_variance * wf);
       out[id * width + i] = scaled_fp8_conversion<true, fp8_type>(
-          static_cast<float>(out_norm), scale_inv);
+          Converter::convert(out_norm_h), scale_inv);
     }
   }
 }
