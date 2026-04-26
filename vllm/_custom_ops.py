@@ -407,16 +407,21 @@ def rotary_embedding(
     rope_dim_offset: int = 0,
     inverse: bool = False,
 ) -> None:
-    torch.ops._C.rotary_embedding(
-        positions,
-        query,
-        key,
-        head_size,
-        cos_sin_cache,
-        is_neox,
-        rope_dim_offset,
-        inverse,
-    )
+    if rope_dim_offset == 0 and not inverse:
+        torch.ops._C.rotary_embedding(
+            positions, query, key, head_size, cos_sin_cache, is_neox
+        )
+    else:
+        torch.ops._C.rotary_embedding(
+            positions,
+            query,
+            key,
+            head_size,
+            cos_sin_cache,
+            is_neox,
+            rope_dim_offset,
+            inverse,
+        )
 
 
 # layer norm ops

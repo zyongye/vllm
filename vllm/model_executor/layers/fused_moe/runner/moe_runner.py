@@ -456,6 +456,7 @@ class MoERunner(MoERunnerInterface):
                 layer=layer,
                 x=hidden_states,
                 router_logits=router_logits,
+                input_ids=input_ids,
             )
         else:
             topk_weights, topk_ids = self.router.select_experts(
