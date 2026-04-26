@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -617,7 +616,9 @@ class DeepseekV4MoE(nn.Module):
         quant_config = vllm_config.quant_config
         self.prefix = prefix
         if vllm_config.parallel_config.enable_expert_parallel:
-            self.use_mega_moe = envs.VLLM_DEEPSEEK_V4_USE_MEGA_MOE
+            self.use_mega_moe = (
+                vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+            )
         else:
             self.use_mega_moe = False
 
