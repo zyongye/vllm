@@ -196,6 +196,7 @@ class DeepseekV2MLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         is_sequence_parallel=False,
+        swiglu_limit: float | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -226,9 +227,14 @@ class DeepseekV2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.swiglu_limit = swiglu_limit
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
+        if self.swiglu_limit is not None:
+            lim = float(self.swiglu_limit)
+            g, u = gate_up.chunk(2, dim=-1)
+            gate_up = torch.cat([g.clamp(max=lim), u.clamp(min=-lim, max=lim)], dim=-1)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x

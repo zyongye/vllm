@@ -167,6 +167,7 @@ class DeepseekV4MoE(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
+                swiglu_limit=self.swiglu_limit,
                 prefix=f"{prefix}.shared_experts",
             )
 
