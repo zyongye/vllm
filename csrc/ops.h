@@ -144,16 +144,17 @@ void fast_topk_v2_plan(const torch::Tensor& seq_lens, torch::Tensor& metadata,
 void fast_topk_v2(const torch::Tensor& scores, const torch::Tensor& seq_lens,
                   const torch::Tensor& page_table, torch::Tensor& page_indices,
                   int64_t page_size, const torch::Tensor& workspace,
-                  const torch::Tensor& metadata);
+                  const torch::Tensor& metadata, int64_t topk);
 
 // Top-k only, no page-table fold-in. Same selection as fast_topk_v2 but
 // emits raw row-local indices into ``topk_indices`` (drop-in for
-// persistent_topk's output contract).
+// persistent_topk's output contract). topk must be one of {512, 1024}.
 void fast_topk_v2_raw(const torch::Tensor& scores,
                       const torch::Tensor& seq_lens,
                       torch::Tensor& topk_indices,
                       const torch::Tensor& workspace,
-                      const torch::Tensor& metadata);
+                      const torch::Tensor& metadata,
+                      int64_t topk);
 
 int64_t fast_topk_v2_workspace_ints();
 

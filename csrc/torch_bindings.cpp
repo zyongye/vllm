@@ -223,12 +223,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   ops.def(
       "fast_topk_v2(Tensor scores, Tensor seq_lens, Tensor page_table, "
-      "Tensor! page_indices, int page_size, Tensor workspace, Tensor metadata)"
-      " -> ()");
+      "Tensor! page_indices, int page_size, Tensor workspace, "
+      "Tensor metadata, int topk) -> ()");
 
   ops.def(
       "fast_topk_v2_raw(Tensor scores, Tensor seq_lens, "
-      "Tensor! topk_indices, Tensor workspace, Tensor metadata) -> ()");
+      "Tensor! topk_indices, Tensor workspace, Tensor metadata, int topk)"
+      " -> ()");
 
   ops.def("fast_topk_v2_workspace_ints() -> int");
 

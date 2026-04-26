@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepSeek V4 indexer top-k (k = 512), ported from sglang's topk_v2 family.
+"""DeepSeek V4 indexer top-k (k = 512 for V4-Flash, k = 1024 for V4-Pro),
+ported from sglang's topk_v2 family.
 
 Three Python wrappers, all over the same underlying kernel:
 
 - :func:`plan_topk_v2`     - run the plan kernel; produces per-batch metadata
-                              that the main kernel reads.
-- :func:`fast_topk_v2_raw` - select the top-512 columns per row, emit raw
+                              that the main kernel reads. K-independent.
+- :func:`fast_topk_v2_raw` - select the top-K columns per row, emit raw
                               row-local indices (drop-in for persistent_topk).
 - :func:`fast_topk_v2`     - same selection + fold the page-table gather
                               into the kernel's output store.
@@ -28,8 +29,10 @@ import torch
 # writes one GlobalMetadata row + one row per batch entry.
 _PLAN_COLS = 4
 
-# Output top-k size. Hardcoded in the kernel.
-_TOPK = 512
+# Output top-k sizes the kernel is compiled for. The user-facing wrappers
+# accept a `topk` argument and the host launcher dispatches to the right
+# template instantiation. V4-Flash uses 512; V4-Pro uses 1024.
+_SUPPORTED_TOPK = (512, 1024)
 
 _WORKSPACE_INTS_PER_BATCH: int | None = None
 
@@ -85,11 +88,13 @@ def fast_topk_v2_raw(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
     *,
+    topk: int = 512,
     metadata: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
     topk_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Top-k only: select the top-512 indices per row, no page-table fold-in.
+    """Top-k only: select the top-``topk`` indices per row, no page-table
+    fold-in.
 
     Drop-in replacement for ``torch.ops._C.persistent_topk``: emits raw
     row-local indices into ``topk_indices``. Use this when the caller wants
@@ -100,21 +105,24 @@ def fast_topk_v2_raw(
     Args:
         scores: float32 ``(B, L)``, ``stride(-1)==1``, ``stride(0) % 4 == 0``.
         seq_lens: int32 ``(B,)``.
+        topk: must be one of ``{512, 1024}`` (V4-Flash and V4-Pro).
         metadata: optional preallocated int32 tensor of shape ``(B + 1, 4)``.
             When provided, the planner writes into it (useful for cudagraph
             capture). When omitted, a fresh tensor is allocated.
         workspace: optional preallocated ``(B, workspace_ints_per_batch())``
             int32, ``stride(-1) == 1``.
-        topk_indices: optional preallocated output ``(B, 512)`` int32
+        topk_indices: optional preallocated output ``(B, topk)`` int32
             contiguous.
 
     Returns:
-        ``(B, 512)`` int32 tensor of raw indices into ``scores[b, :]``,
-        with ``-1`` padding when ``seq_lens[b] < 512``.
+        ``(B, topk)`` int32 tensor of raw indices into ``scores[b, :]``,
+        with ``-1`` padding when ``seq_lens[b] < topk``.
     """
     assert scores.dim() == 2
     assert scores.dtype == torch.float32
     assert scores.is_cuda
+    assert topk in _SUPPORTED_TOPK, (
+        f"fast_topk_v2_raw supports topk in {_SUPPORTED_TOPK}, got {topk}")
     batch_size = scores.size(0)
 
     if metadata is None:
@@ -122,7 +130,7 @@ def fast_topk_v2_raw(
 
     if topk_indices is None:
         topk_indices = scores.new_empty(
-            (batch_size, _TOPK), dtype=torch.int32
+            (batch_size, topk), dtype=torch.int32
         )
     if workspace is None:
         workspace = scores.new_empty(
@@ -130,7 +138,7 @@ def fast_topk_v2_raw(
         )
 
     torch.ops._C.fast_topk_v2_raw(
-        scores, seq_lens, topk_indices, workspace, metadata,
+        scores, seq_lens, topk_indices, workspace, metadata, topk,
     )
     return topk_indices
 
@@ -141,11 +149,13 @@ def fast_topk_v2(
     page_table: torch.Tensor,
     page_size: int,
     *,
+    topk: int = 512,
     metadata: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
     page_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Select top-512 indexer scores per row and fold the page-table gather.
+    """Select top-``topk`` indexer scores per row and fold the page-table
+    gather.
 
     Args:
         scores: float32 logits of shape ``(B, L)``. ``stride(-1) == 1`` and
@@ -154,21 +164,24 @@ def fast_topk_v2(
             considered for row b.
         page_table: int32 ``(B, max_blocks)`` with ``stride(-1) == 1``.
         page_size: power-of-2 page size used by the indexer KV cache.
+        topk: must be one of ``{512, 1024}`` (V4-Flash and V4-Pro).
         metadata: optional preallocated int32 tensor of shape ``(B + 1, 4)``.
             When provided, the planner writes into it (useful for cudagraph
             capture). When omitted, a fresh tensor is allocated.
         workspace: optional preallocated workspace ``(B, workspace_ints_per_batch())``
             int32, ``stride(-1) == 1``. Used for inter-cluster tie staging in
             the large-N path. Allocated on demand if absent.
-        page_indices: optional preallocated output ``(B, 512)`` int32
+        page_indices: optional preallocated output ``(B, topk)`` int32
             contiguous. Allocated on demand if absent.
 
     Returns:
-        ``(B, 512)`` int32 tensor of page-table-resolved indices.
+        ``(B, topk)`` int32 tensor of page-table-resolved indices.
     """
     assert scores.dim() == 2
     assert scores.dtype == torch.float32
     assert scores.is_cuda
+    assert topk in _SUPPORTED_TOPK, (
+        f"fast_topk_v2 supports topk in {_SUPPORTED_TOPK}, got {topk}")
     batch_size = scores.size(0)
 
     if metadata is None:
@@ -178,7 +191,7 @@ def fast_topk_v2(
 
     if page_indices is None:
         page_indices = scores.new_empty(
-            (batch_size, _TOPK), dtype=torch.int32
+            (batch_size, topk), dtype=torch.int32
         )
     if workspace is None:
         workspace = scores.new_empty(
@@ -192,5 +205,6 @@ def fast_topk_v2(
         int(page_size),
         workspace,
         metadata,
+        topk,
     )
     return page_indices

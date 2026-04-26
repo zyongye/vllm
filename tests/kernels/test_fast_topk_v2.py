@@ -517,3 +517,151 @@ def test_raw_path_matches_paged_with_identity_table():
     for b in range(B):
         assert set(raw_out[b].tolist()) == set(paged_out[b].tolist()), (
             f"row {b}: raw and paged-with-identity emitted different sets")
+
+
+# --------------------------------------------------------------------------
+# k=1024 (V4-Pro). The kernel templates K so all the same dispatch paths
+# (Register / Streaming / Cluster) apply at this K too — these tests just
+# repeat the trivial / register / streaming / cluster coverage with K=1024
+# and verify parity against torch.topk and persistent_topk.
+# --------------------------------------------------------------------------
+
+K_PRO = 1024
+
+
+def _reference_topk_raw_k(scores, seq_lens, k):
+    B = scores.shape[0]
+    out = []
+    for b in range(B):
+        sl = int(seq_lens[b])
+        if sl <= k:
+            out.append(set(range(sl)))
+        else:
+            _, raw = torch.topk(scores[b, :sl], k)
+            out.append(set(raw.tolist()))
+    return out
+
+
+@pytest.mark.parametrize("seq_len", [
+    pytest.param(700, id="trivial"),                    # sl <= K=1024
+    pytest.param(1024, id="trivial_boundary"),          # sl == K
+    pytest.param(1025, id="register_just_above_k"),
+    pytest.param(8192, id="register_1p"),
+    pytest.param(SMALL_2PASS - 1, id="register_2p"),
+    pytest.param(40000, id="streaming"),
+])
+def test_pro_simple_paths(seq_len):
+    """k=1024 across trivial / register / streaming."""
+    torch.manual_seed(seq_len)
+    device = torch.device("cuda")
+    B = 4
+    L = (seq_len + 3) & ~3
+    scores = torch.randn(B, L, dtype=torch.float32, device=device)
+    seq_lens = torch.full((B,), seq_len, dtype=torch.int32, device=device)
+    indices = fast_topk_v2_raw(scores, seq_lens, topk=K_PRO)
+    torch.cuda.synchronize()
+
+    expected = _reference_topk_raw_k(scores, seq_lens, K_PRO)
+    for b in range(B):
+        sl = int(seq_lens[b])
+        valid = min(sl, K_PRO)
+        row = indices[b].tolist()
+        if sl < K_PRO:
+            assert all(v == -1 for v in row[sl:])
+        got = set(row[:valid]) - {-1}
+        assert got == expected[b], (
+            f"row {b} sl={sl}: missing={len(expected[b] - got)} "
+            f"extra={len(got - expected[b])}")
+
+
+@pytest.mark.parametrize("batch_size,seq_len", [
+    pytest.param(2, 65536, id="cluster_fused_64k"),
+    pytest.param(NUM_CLUSTERS + 1, 65536, id="cluster_two_stage_just_over"),
+    pytest.param(32, 96000, id="cluster_two_stage_32x96k"),
+])
+def test_pro_cluster_path(batch_size, seq_len):
+    """k=1024 across the cluster paths (fused and two-stage)."""
+    torch.manual_seed(seq_len * batch_size)
+    device = torch.device("cuda")
+    L = (seq_len + 3) & ~3
+    scores = torch.randn(batch_size, L, dtype=torch.float32, device=device)
+    seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32,
+                          device=device)
+    metadata = plan_topk_v2(seq_lens, static_cluster_threshold=SMALL_2PASS)
+    indices = fast_topk_v2_raw(scores, seq_lens, topk=K_PRO,
+                               metadata=metadata)
+    torch.cuda.synchronize()
+    expected = _reference_topk_raw_k(scores, seq_lens, K_PRO)
+    for b in range(batch_size):
+        got = set(indices[b].tolist()) - {-1}
+        assert got == expected[b], (
+            f"row {b}: missing={len(expected[b] - got)} "
+            f"extra={len(got - expected[b])}")
+
+
+@pytest.mark.parametrize("config", [
+    pytest.param((1, 1, 1024), id="pro_short"),
+    pytest.param((8, 1, 8192), id="pro_register"),
+    pytest.param((4, 4, 4096), id="pro_native_mtp"),       # 2D seq_lens
+    pytest.param((16, 1, 32768), id="pro_register_2pass"),
+    pytest.param((32, 1, 50000), id="pro_streaming"),
+])
+def test_pro_dispatch_matches_persistent_topk(config):
+    """k=1024 parity against persistent_topk on V4-Pro decode shapes."""
+    from vllm.model_executor.layers.sparse_attn_indexer import (
+        RADIX_TOPK_WORKSPACE_SIZE, _can_use_fast_topk_v2,
+    )
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        init_workspace_manager,
+        is_workspace_manager_initialized,
+    )
+
+    if not _can_use_fast_topk_v2(K_PRO):
+        pytest.skip("fast_topk_v2 not callable in this environment")
+
+    device = torch.device("cuda")
+    if not is_workspace_manager_initialized():
+        init_workspace_manager(device=device, num_ubatches=1)
+    wsm = current_workspace_manager()
+
+    B, next_n, L = config
+    num_rows = B * next_n
+    L_aligned = (L + 3) & ~3
+
+    torch.manual_seed(B * next_n * L)
+    logits = torch.randn(num_rows, L_aligned, dtype=torch.float32,
+                         device=device)
+    seq_lens_2d = torch.randint(1, L + 1, (B, next_n), dtype=torch.int32,
+                                device=device)
+
+    seq_lens_flat = seq_lens_2d.reshape(-1)
+    out_v2 = torch.full((num_rows, K_PRO), -1, dtype=torch.int32,
+                        device=device)
+    metadata = plan_topk_v2(seq_lens_flat)
+    (workspace,) = wsm.get_simultaneous(
+        ((num_rows, workspace_ints_per_batch()), torch.int32),
+    )
+    fast_topk_v2_raw(
+        logits, seq_lens_flat, topk=K_PRO,
+        metadata=metadata, workspace=workspace, topk_indices=out_v2,
+    )
+
+    out_ref = torch.full((num_rows, K_PRO), -1, dtype=torch.int32,
+                         device=device)
+    (ref_workspace,) = wsm.get_simultaneous(
+        ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8))
+    torch.ops._C.persistent_topk(logits, seq_lens_2d, out_ref, ref_workspace,
+                                 K_PRO, L_aligned)
+    torch.cuda.synchronize()
+
+    for r in range(num_rows):
+        sl = int(seq_lens_flat[r])
+        valid = min(sl, K_PRO)
+        v2 = set(out_v2[r, :valid].tolist()) - {-1}
+        ref = set(out_ref[r, :valid].tolist()) - {-1}
+        assert v2 == ref, (
+            f"row {r} sl={sl}: v2 has {len(v2 - ref)} not in ref, "
+            f"ref has {len(ref - v2)} not in v2")
+        if sl < K_PRO:
+            assert (out_v2[r, sl:] == -1).all(), f"row {r}: pad violated"

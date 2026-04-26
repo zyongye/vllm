@@ -38,8 +38,9 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 
 def _can_use_fast_topk_v2(topk_tokens: int) -> bool:
-    """Hopper / Blackwell-DC + k=512 (DeepSeek V4 indexer) gates the path."""
-    if topk_tokens != 512 or not current_platform.is_cuda():
+    """Hopper / Blackwell-DC + k in {512, 1024} (V4 Flash / Pro) gates the
+    path."""
+    if topk_tokens not in (512, 1024) or not current_platform.is_cuda():
         return False
     # sm_90 (Hopper) and sm_100/sm_103 (Blackwell datacenter) support thread-
     # block clusters, TMA, and PDL. sm_120 (consumer Blackwell) does not.
@@ -349,6 +350,7 @@ def sparse_attn_indexer(
             fast_topk_v2_raw(
                 logits,
                 seq_lens_flat,
+                topk=topk_tokens,
                 metadata=fast_topk_v2_metadata,
                 topk_indices=topk_indices,
             )
