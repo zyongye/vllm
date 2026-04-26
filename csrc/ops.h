@@ -124,6 +124,30 @@ void persistent_topk(const torch::Tensor& logits, const torch::Tensor& lengths,
                      torch::Tensor& output, torch::Tensor& workspace, int64_t k,
                      int64_t max_seq_len);
 
+// DeepSeek V4 indexer top-k (k = 512). Hopper (sm_90a) and Blackwell
+// datacenter (sm_100/sm_103) — needs thread-block clusters, TMA, and PDL.
+// Two-step API:
+// 1. fast_topk_v2_plan inspects the seq_lens distribution and writes a
+//    cluster_threshold + per-row Metadata into a (B+1, 4) int32 tensor. The
+//    plan is amortized when cudagraph-captured: once per shape, reused across
+//    layers.
+// 2. fast_topk_v2 selects the top-512 indices per row, folds the page-table
+//    gather into the radix store, and writes (B, 512) int32 page indices.
+//    Dispatches per row to one of three strategies (Register / Streaming /
+//    Cluster) using the planned threshold.
+//
+// Returns the size in int32s of the per-row workspace required by
+// fast_topk_v2 (allocate `(B, fast_topk_v2_workspace_ints())` int32 contig).
+void fast_topk_v2_plan(const torch::Tensor& seq_lens, torch::Tensor& metadata,
+                       int64_t static_cluster_threshold);
+
+void fast_topk_v2(const torch::Tensor& scores, const torch::Tensor& seq_lens,
+                  const torch::Tensor& page_table, torch::Tensor& page_indices,
+                  int64_t page_size, const torch::Tensor& workspace,
+                  const torch::Tensor& metadata);
+
+int64_t fast_topk_v2_workspace_ints();
+
 void rms_norm_static_fp8_quant(torch::Tensor& out, torch::Tensor& input,
                                torch::Tensor& weight, torch::Tensor& scale,
                                double epsilon);

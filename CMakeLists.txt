@@ -560,6 +560,27 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
                    "in CUDA target architectures.")
   endif()
 
+  # DeepSeek V4 indexer top-k. Needs thread-block clusters + TMA + PDL, so
+  # builds for Hopper (sm_90a) and Blackwell datacenter (sm_100/sm_103). Not
+  # supported on sm_120 (consumer Blackwell, no clusters). Requires CUDA >=
+  # 12.4 for the cuda::ptx mbarrier wrappers. Ported from sglang.
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    cuda_archs_loose_intersection(DSV4_TOPK_ARCHS "9.0a;10.0f;11.0f" "${CUDA_ARCHS}")
+  else()
+    cuda_archs_loose_intersection(DSV4_TOPK_ARCHS "9.0a;10.0a;10.1a;10.3a" "${CUDA_ARCHS}")
+  endif()
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.4 AND DSV4_TOPK_ARCHS)
+    set(DSV4_TOPK_SRC "csrc/deepseek_v4/fast_topk_v2.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${DSV4_TOPK_SRC}"
+      CUDA_ARCHS "${DSV4_TOPK_ARCHS}")
+    list(APPEND VLLM_EXT_SRC ${DSV4_TOPK_SRC})
+    message(STATUS "Building deepseek_v4 fast_topk_v2 for archs: ${DSV4_TOPK_ARCHS}")
+  else()
+    message(STATUS "Not building deepseek_v4 fast_topk_v2 (needs CUDA >= 12.4 "
+                   "and a compatible Hopper+ arch).")
+  endif()
+
   #
   # Machete kernels
 
