@@ -36,6 +36,21 @@ logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
+
+def _can_use_fast_topk_v2(topk_tokens: int) -> bool:
+    """Hopper / Blackwell-DC + k in {512, 1024} (V4 Flash / Pro) gates the
+    path."""
+    if topk_tokens not in (512, 1024) or not current_platform.is_cuda():
+        return False
+    # sm_90 (Hopper) and sm_100/sm_103 (Blackwell datacenter) support thread-
+    # block clusters, TMA, and PDL. sm_120 (consumer Blackwell) does not.
+    major, minor = torch.cuda.get_device_capability()
+    if major == 9:
+        return True
+    if major == 10 and minor in (0, 3):
+        return True
+    return False
+
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
 
@@ -110,6 +125,10 @@ def sparse_attn_indexer(
         values_spec, scales_spec = _gather_workspace_shapes(
             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
         )
+        # Reserve the larger of the two top-k workspaces. fast_topk_v2 needs
+        # (num_rows, kWorkspaceInts) int32 + (num_rows+1, 4) int32. We don't
+        # know num_rows at profiling time, but the manager grows on the real
+        # call path; this reservation is a floor.
         current_workspace_manager().get_simultaneous(
             values_spec,
             scales_spec,
@@ -318,7 +337,24 @@ def sparse_attn_indexer(
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if current_platform.is_cuda() and topk_tokens in (512, 2048):
+        if _can_use_fast_topk_v2(topk_tokens):
+            from vllm.v1.attention.ops.deepseek_v4_ops.fast_topk import (
+                fast_topk_v2_raw,
+                plan_topk_v2,
+            )
+            fast_topk_v2_metadata = getattr(attn_metadata, "fast_topk_v2_metadata", None)
+            seq_lens_flat = seq_lens.reshape(-1)
+            if fast_topk_v2_metadata is None:
+                fast_topk_v2_metadata = plan_topk_v2(seq_lens_flat)
+                attn_metadata.fast_topk_v2_metadata = fast_topk_v2_metadata
+            fast_topk_v2_raw(
+                logits,
+                seq_lens_flat,
+                topk=topk_tokens,
+                metadata=fast_topk_v2_metadata,
+                topk_indices=topk_indices,
+            )
+        elif current_platform.is_cuda() and topk_tokens in (512, 2048):
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),

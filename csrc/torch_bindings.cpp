@@ -213,6 +213,26 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor workspace, int k, int max_seq_len) -> ()");
   ops.impl("persistent_topk", torch::kCUDA, &persistent_topk);
 
+  // DeepSeek V4 indexer top-k (k=512), ported from sglang's topk_v2 family.
+  // Built for sm_90a (Hopper) + sm_100a/sm_103 (Blackwell datacenter).
+  // Schema only here; impl is registered in csrc/deepseek_v4/fast_topk_v2.cu
+  // so it's only present when CMake compiles the source for a supported arch.
+  ops.def(
+      "fast_topk_v2_plan(Tensor seq_lens, Tensor! metadata, "
+      "int static_cluster_threshold) -> ()");
+
+  ops.def(
+      "fast_topk_v2(Tensor scores, Tensor seq_lens, Tensor page_table, "
+      "Tensor! page_indices, int page_size, Tensor workspace, "
+      "Tensor metadata, int topk) -> ()");
+
+  ops.def(
+      "fast_topk_v2_raw(Tensor scores, Tensor seq_lens, "
+      "Tensor! topk_indices, Tensor workspace, Tensor metadata, int topk)"
+      " -> ()");
+
+  ops.def("fast_topk_v2_workspace_ints() -> int");
+
   // Layernorm-quant
   // Apply Root Mean Square (RMS) Normalization to the input tensor.
   ops.def(
