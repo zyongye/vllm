@@ -128,7 +128,7 @@ def test_deepgemm_fp8_mqa_logits(clean_logits: bool):
                 q_fp8 = q.to(torch.float8_e4m3fn)
                 kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0,), False)
                 logits = fp8_fp4_mqa_logits(
-                    q_fp8, kv_fp8, weights, ks, ke, clean_logits=clean_logits
+                    (q_fp8, None), kv_fp8, weights, ks, ke, clean_logits=clean_logits
                 )
 
                 ref_logits = _ref_fp8_mqa_logits(
