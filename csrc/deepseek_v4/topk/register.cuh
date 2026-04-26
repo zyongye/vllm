@@ -304,7 +304,8 @@ struct RegisterTopK {
     }
   }
 
-  VLLM_DSV4_DEVICE static void transform(TransformParams params) {
+  template <typename TParams>
+  VLLM_DSV4_DEVICE static void transform(TParams params) {
     __syncthreads();
     if (const auto tx = threadIdx.x; tx < K) params.transform(tx);
   }

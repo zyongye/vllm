@@ -226,6 +226,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor! page_indices, int page_size, Tensor workspace, Tensor metadata)"
       " -> ()");
 
+  ops.def(
+      "fast_topk_v2_raw(Tensor scores, Tensor seq_lens, "
+      "Tensor! topk_indices, Tensor workspace, Tensor metadata) -> ()");
+
   ops.def("fast_topk_v2_workspace_ints() -> int");
 
   // Layernorm-quant

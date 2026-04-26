@@ -146,6 +146,15 @@ void fast_topk_v2(const torch::Tensor& scores, const torch::Tensor& seq_lens,
                   int64_t page_size, const torch::Tensor& workspace,
                   const torch::Tensor& metadata);
 
+// Top-k only, no page-table fold-in. Same selection as fast_topk_v2 but
+// emits raw row-local indices into ``topk_indices`` (drop-in for
+// persistent_topk's output contract).
+void fast_topk_v2_raw(const torch::Tensor& scores,
+                      const torch::Tensor& seq_lens,
+                      torch::Tensor& topk_indices,
+                      const torch::Tensor& workspace,
+                      const torch::Tensor& metadata);
+
 int64_t fast_topk_v2_workspace_ints();
 
 void rms_norm_static_fp8_quant(torch::Tensor& out, torch::Tensor& input,

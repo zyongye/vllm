@@ -191,7 +191,8 @@ struct StreamingTopK {
     stream_pass<true>(scores, length, smem->match.bin, topk_indices, smem);
   }
 
-  VLLM_DSV4_DEVICE static void transform(TransformParams params, void* _smem) {
+  template <typename TParams>
+  VLLM_DSV4_DEVICE static void transform(TParams params, void* _smem) {
     // Phase D: page-translate above entries, then refine ties.
     const auto smem = static_cast<Smem*>(_smem);
     const auto tx = threadIdx.x;

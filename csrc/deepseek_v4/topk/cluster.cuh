@@ -195,7 +195,8 @@ struct ClusterTopK {
     __syncthreads();
   }
 
-  VLLM_DSV4_DEVICE static void stage1_epilogue(TransformParams params,
+  template <typename TParams>
+  VLLM_DSV4_DEVICE static void stage1_epilogue(TParams params,
                                                uint32_t offset, void* _ws,
                                                void* _smem) {
     auto cluster = cooperative_groups::this_cluster();
@@ -249,7 +250,8 @@ struct ClusterTopK {
     }
   }
 
-  VLLM_DSV4_DEVICE static void transform(TransformParams params, const void* _ws,
+  template <typename TParams>
+  VLLM_DSV4_DEVICE static void transform(TParams params, const void* _ws,
                                          void* _smem) {
     const auto ws = static_cast<const WorkSpace*>(_ws);
     const auto meta = &ws->metadata;

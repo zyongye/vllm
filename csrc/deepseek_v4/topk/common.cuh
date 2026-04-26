@@ -33,22 +33,44 @@ VLLM_DSV4_DEVICE int32_t page_to_indices(const int32_t* __restrict__ page_table,
   return (page_table[i >> page_bits] << page_bits) | (i & mask);
 }
 
-// Output-side description of the page-table fold-in: each strategy writes
-// either (a) `transform(idx)` for entries already known to be in the top-k,
-// or (b) `write(dst, src)` for entries whose final rank is determined later.
-struct TransformParams {
+// Output-side description of how each strategy commits its top-k output.
+//
+// Two modes, picked at compile time via ``kRawOutput``:
+//   - kRawOutput=false (paged): fold the page-table gather into the output
+//     store. ``write(dst, src)`` emits ``page_to_indices(table, src, bits)``;
+//     ``transform(idx)`` reads ``indices_in[idx]`` and re-emits via the
+//     page lookup. This is the original kernel behavior.
+//   - kRawOutput=true  (raw):   skip the page lookup entirely. The kernel
+//     just writes row-local raw indices, matching ``persistent_topk``'s
+//     output contract. ``page_table`` and ``page_bits`` are unused; the
+//     compiler eliminates the dead loads via ``if constexpr``.
+template <bool kRawOutput>
+struct TransformParamsT {
   const int32_t* __restrict__ page_table;
   const int32_t* __restrict__ indices_in;
   int32_t* __restrict__ indices_out;
   uint32_t page_bits;
 
   VLLM_DSV4_DEVICE void transform(uint32_t idx) const {
-    indices_out[idx] = page_to_indices(page_table, indices_in[idx], page_bits);
+    if constexpr (kRawOutput) {
+      indices_out[idx] = static_cast<int32_t>(indices_in[idx]);
+    } else {
+      indices_out[idx] =
+          page_to_indices(page_table, indices_in[idx], page_bits);
+    }
   }
   VLLM_DSV4_DEVICE void write(uint32_t dst, uint32_t src) const {
-    indices_out[dst] = page_to_indices(page_table, src, page_bits);
+    if constexpr (kRawOutput) {
+      indices_out[dst] = static_cast<int32_t>(src);
+    } else {
+      indices_out[dst] = page_to_indices(page_table, src, page_bits);
+    }
   }
 };
+
+// Back-compat alias. The four kernels in fast_topk_v2.cu instantiate both
+// variants explicitly via templates.
+using TransformParams = TransformParamsT<false>;
 
 struct alignas(16) MatchBin {
   uint32_t bin;
@@ -99,8 +121,9 @@ VLLM_DSV4_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
 }
 
 // Fast path when seq_len <= K: identity mapping, padded to K with -1.
-VLLM_DSV4_DEVICE void trivial_transform(const TransformParams& params,
-                                        uint32_t length, uint32_t K) {
+template <typename TParams>
+VLLM_DSV4_DEVICE void trivial_transform(const TParams& params, uint32_t length,
+                                        uint32_t K) {
   const auto tx = threadIdx.x;
   if (tx < length) {
     params.write(tx, tx);
@@ -113,9 +136,10 @@ VLLM_DSV4_DEVICE void trivial_transform(const TransformParams& params,
 // region. One block-wide radix pass over the full 32-bit key (fp32 bit
 // pattern, with idx as a secondary key). Writes at most `K - num_above`
 // entries via params.write(...).
+template <typename TParams>
 VLLM_DSV4_DEVICE void tie_handle_transform(const Tie* __restrict__ ties,
                                            uint32_t num_ties, uint32_t num_above,
-                                           uint32_t K, TransformParams params,
+                                           uint32_t K, TParams params,
                                            void* _smem) {
   auto* smem = static_cast<TieHandleSmem*>(_smem);
   const auto tx = threadIdx.x;

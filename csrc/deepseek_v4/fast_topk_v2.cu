@@ -87,8 +87,9 @@ struct TopKParams {
   VLLM_DSV4_DEVICE const float* get_scores(uint32_t batch_id) const {
     return scores + batch_id * score_stride;
   }
-  VLLM_DSV4_DEVICE TransformParams get_transform(uint32_t batch_id,
-                                                 int32_t* indices) const {
+  template <bool kRawOutput>
+  VLLM_DSV4_DEVICE TransformParamsT<kRawOutput> get_transform(
+      uint32_t batch_id, int32_t* indices) const {
     return {
         .page_table = page_table + batch_id * page_table_stride,
         .indices_in = indices,
@@ -215,13 +216,15 @@ VLLM_PLAN_KERNEL void topk_plan(const uint32_t* __restrict__ seq_lens,
 // Small::kMax1PassLength).
 // --------------------------------------------------------------------------
 
+template <bool kRawOutput>
 VLLM_SMALL_TOPK_KERNEL void topk_short_transform(
     const __grid_constant__ TopKParams params) {
   alignas(128) extern __shared__ uint8_t smem[];
   __shared__ int32_t s_topk_indices[512];
   const auto batch_id = blockIdx.x;
   const auto seq_len = params.seq_lens[batch_id];
-  const auto transform = params.get_transform(batch_id, s_topk_indices);
+  const auto transform =
+      params.template get_transform<kRawOutput>(batch_id, s_topk_indices);
   if (seq_len <= 512) {
     trivial_transform(transform, seq_len, 512);
   } else {
@@ -237,6 +240,7 @@ VLLM_SMALL_TOPK_KERNEL void topk_short_transform(
 // walks `metadata[1..N]` round-robin and runs Large::stage1 per item.
 // --------------------------------------------------------------------------
 
+template <bool kRawOutput>
 VLLM_LARGE_TOPK_STAGE_1 void topk_combine_preprocess(
     const __grid_constant__ TopKParams params) {
   alignas(128) extern __shared__ uint8_t smem[];
@@ -271,7 +275,8 @@ VLLM_LARGE_TOPK_STAGE_1 void topk_combine_preprocess(
     const auto this_length = length;
     const auto this_offset = offset;
     const auto need_prefetch = has_next;
-    const auto transform = params.get_transform(batch_id, s_topk_indices);
+    const auto transform =
+        params.template get_transform<kRawOutput>(batch_id, s_topk_indices);
     const auto ws = params.workspace + batch_id * params.workspace_stride;
     if (need_prefetch) prefetch_metadata();
     Large::stage1(s_topk_indices, this_length, smem, /*reuse=*/true);
@@ -285,6 +290,7 @@ VLLM_LARGE_TOPK_STAGE_1 void topk_combine_preprocess(
 // Stage 2 (non-cluster). Per-row dispatch: trivial / Small / Medium / Large.
 // --------------------------------------------------------------------------
 
+template <bool kRawOutput>
 VLLM_LARGE_TOPK_STAGE_2 void topk_combine_transform(
     const __grid_constant__ TopKParams params) {
   alignas(128) extern __shared__ uint8_t smem[];
@@ -292,7 +298,8 @@ VLLM_LARGE_TOPK_STAGE_2 void topk_combine_transform(
   const auto batch_id = blockIdx.x;
   const auto seq_len = params.seq_lens[batch_id];
   const auto cluster_threshold = params.get_global_metadata().cluster_threshold;
-  const auto transform = params.get_transform(batch_id, s_topk_indices);
+  const auto transform =
+      params.template get_transform<kRawOutput>(batch_id, s_topk_indices);
   if (seq_len <= 512) {
     trivial_transform(transform, seq_len, 512);
   } else if (seq_len <= kMax2PassLength) {
@@ -319,6 +326,7 @@ VLLM_LARGE_TOPK_STAGE_2 void topk_combine_transform(
 // the same launch; cluster rank 0 finishes the row.
 // --------------------------------------------------------------------------
 
+template <bool kRawOutput>
 VLLM_FUSED_COMBINE_KERNEL void topk_fused_transform(
     const __grid_constant__ TopKParams params) {
   alignas(128) extern __shared__ uint8_t smem[];
@@ -326,7 +334,8 @@ VLLM_FUSED_COMBINE_KERNEL void topk_fused_transform(
   const auto batch_id = blockIdx.x;
   const auto cluster_rank = blockIdx.y;
   const auto seq_len = params.seq_lens[batch_id];
-  const auto transform = params.get_transform(batch_id, s_topk_indices);
+  const auto transform =
+      params.template get_transform<kRawOutput>(batch_id, s_topk_indices);
   if (seq_len <= 512) {
     if (cluster_rank != 0) return;
     trivial_transform(transform, seq_len, 512);
@@ -417,6 +426,85 @@ void fast_topk_v2_plan(const torch::Tensor& seq_lens, torch::Tensor& metadata,
               cudaGetErrorString(cudaGetLastError()));
 }
 
+namespace vllm::dsv4_topk {
+
+// Shared dispatch path for fast_topk_v2 and fast_topk_v2_raw. Templated on
+// kRawOutput (false: fold the page-table gather; true: write raw row-local
+// indices). The set of input tensors is the same modulo (page_table,
+// page_size), which the caller has already validated.
+template <bool kRawOutput>
+static void launch_dispatch(const TopKParams& params, uint32_t batch_size,
+                            uint32_t max_seq_len, cudaStream_t stream) {
+  // Helper: build a cudaLaunchConfig with optional PDL + cluster attributes.
+  // The attribute storage must outlive cudaLaunchKernelEx (cfg.attrs points
+  // into it), so it lives in each call site below as a stack local.
+  auto make_cfg = [&](dim3 grid, dim3 block, size_t smem,
+                      cudaLaunchAttribute* attrs, bool enable_cluster,
+                      bool enable_pdl) {
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = static_cast<unsigned>(smem);
+    cfg.stream = stream;
+    int n = 0;
+    if (enable_pdl) {
+      attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attrs[n].val.programmaticStreamSerializationAllowed = 1;
+      ++n;
+    }
+    if (enable_cluster) {
+      attrs[n].id = cudaLaunchAttributeClusterDimension;
+      attrs[n].val.clusterDim = {1, kClusterSize, 1};
+      ++n;
+    }
+    cfg.numAttrs = n;
+    cfg.attrs = n ? attrs : nullptr;
+    return cfg;
+  };
+
+  auto check_launch = [](cudaError_t err) {
+    TORCH_CHECK(err == cudaSuccess,
+                "fast_topk_v2 launch failed: ", cudaGetErrorString(err));
+  };
+
+  if (max_seq_len <= Small::kMax1PassLength) {
+    setup_kernel_smem_once<&topk_short_transform<kRawOutput>, kStage2SMEM>();
+    cudaLaunchAttribute attrs[2];
+    auto cfg = make_cfg(dim3(batch_size), dim3(kBlockSize), kStage2SMEM, attrs,
+                        /*cluster=*/false, /*pdl=*/true);
+    check_launch(cudaLaunchKernelEx(&cfg, topk_short_transform<kRawOutput>,
+                                    params));
+  } else if (batch_size <= kNumClusters) {
+    constexpr size_t kFusedSMEM =
+        kStage1SMEM > kStage2SMEM ? kStage1SMEM : kStage2SMEM;
+    setup_kernel_smem_once<&topk_fused_transform<kRawOutput>, kFusedSMEM>();
+    cudaLaunchAttribute attrs[2];
+    auto cfg = make_cfg(dim3(batch_size, kClusterSize), dim3(kBlockSize),
+                        kFusedSMEM, attrs, /*cluster=*/true, /*pdl=*/true);
+    check_launch(cudaLaunchKernelEx(&cfg, topk_fused_transform<kRawOutput>,
+                                    params));
+  } else {
+    const auto num_clusters = std::min<uint32_t>(batch_size, kNumClusters);
+    setup_kernel_smem_once<&topk_combine_preprocess<kRawOutput>,
+                           kStage1SMEM>();
+    cudaLaunchAttribute attrs1[2];
+    auto cfg1 = make_cfg(dim3(num_clusters, kClusterSize), dim3(kBlockSize),
+                         kStage1SMEM, attrs1, /*cluster=*/true, /*pdl=*/true);
+    check_launch(cudaLaunchKernelEx(
+        &cfg1, topk_combine_preprocess<kRawOutput>, params));
+
+    setup_kernel_smem_once<&topk_combine_transform<kRawOutput>,
+                           kStage2SMEM>();
+    cudaLaunchAttribute attrs2[2];
+    auto cfg2 = make_cfg(dim3(batch_size), dim3(kBlockSize), kStage2SMEM,
+                         attrs2, /*cluster=*/false, /*pdl=*/true);
+    check_launch(cudaLaunchKernelEx(&cfg2, topk_combine_transform<kRawOutput>,
+                                    params));
+  }
+}
+
+}  // namespace vllm::dsv4_topk
+
 void fast_topk_v2(const torch::Tensor& scores, const torch::Tensor& seq_lens,
                   const torch::Tensor& page_table, torch::Tensor& page_indices,
                   int64_t page_size, const torch::Tensor& workspace,
@@ -484,68 +572,76 @@ void fast_topk_v2(const torch::Tensor& scores, const torch::Tensor& seq_lens,
       .page_bits = page_bits,
   };
 
-  const auto stream = at::cuda::getCurrentCUDAStream().stream();
+  launch_dispatch<false>(params, batch_size, max_seq_len,
+                         at::cuda::getCurrentCUDAStream().stream());
+}
 
-  // Helper: build a cudaLaunchConfig with optional PDL + cluster attributes.
-  // The attribute storage must outlive cudaLaunchKernelEx (cfg.attrs points
-  // into it), so we keep it as a local in each call site.
-  auto make_cfg = [&](dim3 grid, dim3 block, size_t smem,
-                      cudaLaunchAttribute* attrs, bool enable_cluster,
-                      bool enable_pdl) {
-    cudaLaunchConfig_t cfg{};
-    cfg.gridDim = grid;
-    cfg.blockDim = block;
-    cfg.dynamicSmemBytes = static_cast<unsigned>(smem);
-    cfg.stream = stream;
-    int n = 0;
-    if (enable_pdl) {
-      attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      attrs[n].val.programmaticStreamSerializationAllowed = 1;
-      ++n;
-    }
-    if (enable_cluster) {
-      attrs[n].id = cudaLaunchAttributeClusterDimension;
-      attrs[n].val.clusterDim = {1, kClusterSize, 1};
-      ++n;
-    }
-    cfg.numAttrs = n;
-    cfg.attrs = n ? attrs : nullptr;
-    return cfg;
+// Top-k only: skip the page-table gather and emit raw row-local indices.
+// Same selection algorithm as fast_topk_v2; just doesn't touch a page
+// table. Output semantics match torch.ops._C.persistent_topk and the V4
+// indexer's existing topk_indices_buffer contract.
+void fast_topk_v2_raw(const torch::Tensor& scores,
+                      const torch::Tensor& seq_lens,
+                      torch::Tensor& topk_indices,
+                      const torch::Tensor& workspace,
+                      const torch::Tensor& metadata) {
+  using namespace vllm::dsv4_topk;
+  CHECK_CUDA(scores);
+  CHECK_CUDA(seq_lens);
+  CHECK_CUDA(topk_indices);
+  CHECK_CUDA(workspace);
+  CHECK_CUDA(metadata);
+  CHECK_DTYPE(scores, torch::kFloat32);
+  CHECK_DTYPE(seq_lens, torch::kInt32);
+  CHECK_DTYPE(topk_indices, torch::kInt32);
+  CHECK_DTYPE(workspace, torch::kInt32);
+  CHECK_DTYPE(metadata, torch::kInt32);
+
+  TORCH_CHECK(scores.dim() == 2 && scores.stride(1) == 1,
+              "scores must be 2D with last stride 1");
+  TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.is_contiguous());
+  TORCH_CHECK(topk_indices.dim() == 2 && topk_indices.is_contiguous() &&
+                  topk_indices.size(1) == 512,
+              "topk_indices must be (B, 512) contiguous");
+  TORCH_CHECK(workspace.dim() == 2 && workspace.stride(1) == 1 &&
+                  workspace.size(1) == Large::kWorkspaceInts,
+              "workspace must be (B, kWorkspaceInts) with last stride 1");
+  TORCH_CHECK(metadata.dim() == 2 && metadata.size(1) == 4 &&
+                  metadata.is_contiguous(),
+              "metadata must be (B + 1, 4) contiguous");
+
+  const auto batch_size = static_cast<uint32_t>(scores.size(0));
+  TORCH_CHECK(seq_lens.size(0) == batch_size);
+  TORCH_CHECK(topk_indices.size(0) == batch_size);
+  TORCH_CHECK(workspace.size(0) == batch_size);
+  TORCH_CHECK(metadata.size(0) == batch_size + 1);
+
+  const auto max_seq_len = static_cast<uint32_t>(scores.size(1));
+  TORCH_CHECK(scores.stride(0) % 4 == 0,
+              "score stride must be a multiple of 4 (TMA 16-byte alignment)");
+
+  // page_table / page_bits are unused on the raw path; passing nullptr/0 is
+  // safe because every kernel call site is gated by `if constexpr
+  // (kRawOutput)` so the page-table loads are eliminated at compile time.
+  TopKParams params{
+      .seq_lens =
+          reinterpret_cast<const uint32_t*>(seq_lens.data_ptr<int32_t>()),
+      .scores = scores.data_ptr<float>(),
+      .page_table = nullptr,
+      .page_indices = topk_indices.data_ptr<int32_t>(),
+      .score_stride = scores.stride(0),
+      .page_table_stride = 0,
+      .workspace = reinterpret_cast<uint8_t*>(workspace.data_ptr<int32_t>()),
+      .metadata =
+          reinterpret_cast<const Metadata*>(metadata.data_ptr<int32_t>()),
+      .workspace_stride =
+          workspace.stride(0) * static_cast<int64_t>(sizeof(int32_t)),
+      .batch_size = batch_size,
+      .page_bits = 0,
   };
 
-  auto check_launch = [](cudaError_t err) {
-    TORCH_CHECK(err == cudaSuccess,
-                "fast_topk_v2 launch failed: ", cudaGetErrorString(err));
-  };
-
-  if (max_seq_len <= Small::kMax1PassLength) {
-    setup_kernel_smem_once<&topk_short_transform, kStage2SMEM>();
-    cudaLaunchAttribute attrs[2];
-    auto cfg = make_cfg(dim3(batch_size), dim3(kBlockSize), kStage2SMEM, attrs,
-                        /*cluster=*/false, /*pdl=*/true);
-    check_launch(cudaLaunchKernelEx(&cfg, topk_short_transform, params));
-  } else if (batch_size <= kNumClusters) {
-    constexpr size_t kFusedSMEM =
-        kStage1SMEM > kStage2SMEM ? kStage1SMEM : kStage2SMEM;
-    setup_kernel_smem_once<&topk_fused_transform, kFusedSMEM>();
-    cudaLaunchAttribute attrs[2];
-    auto cfg = make_cfg(dim3(batch_size, kClusterSize), dim3(kBlockSize),
-                        kFusedSMEM, attrs, /*cluster=*/true, /*pdl=*/true);
-    check_launch(cudaLaunchKernelEx(&cfg, topk_fused_transform, params));
-  } else {
-    const auto num_clusters = std::min<uint32_t>(batch_size, kNumClusters);
-    setup_kernel_smem_once<&topk_combine_preprocess, kStage1SMEM>();
-    cudaLaunchAttribute attrs1[2];
-    auto cfg1 = make_cfg(dim3(num_clusters, kClusterSize), dim3(kBlockSize),
-                         kStage1SMEM, attrs1, /*cluster=*/true, /*pdl=*/true);
-    check_launch(cudaLaunchKernelEx(&cfg1, topk_combine_preprocess, params));
-
-    setup_kernel_smem_once<&topk_combine_transform, kStage2SMEM>();
-    cudaLaunchAttribute attrs2[2];
-    auto cfg2 = make_cfg(dim3(batch_size), dim3(kBlockSize), kStage2SMEM,
-                         attrs2, /*cluster=*/false, /*pdl=*/true);
-    check_launch(cudaLaunchKernelEx(&cfg2, topk_combine_transform, params));
-  }
+  launch_dispatch<true>(params, batch_size, max_seq_len,
+                        at::cuda::getCurrentCUDAStream().stream());
 }
 
 int64_t fast_topk_v2_workspace_ints() {
@@ -559,6 +655,7 @@ int64_t fast_topk_v2_workspace_ints() {
 TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, m) {
   m.impl("fast_topk_v2_plan", &fast_topk_v2_plan);
   m.impl("fast_topk_v2", &fast_topk_v2);
+  m.impl("fast_topk_v2_raw", &fast_topk_v2_raw);
 }
 
 TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CompositeExplicitAutograd, m) {

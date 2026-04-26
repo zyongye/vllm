@@ -28,6 +28,7 @@ import torch
 from vllm.platforms import current_platform
 from vllm.v1.attention.ops.deepseek_v4_ops.fast_topk import (
     fast_topk_v2,
+    fast_topk_v2_raw,
     plan_topk_v2,
     workspace_ints_per_batch,
 )
@@ -331,6 +332,80 @@ def test_metadata_can_be_reused_across_calls():
         assert set(out_b[b].tolist()) == expected_b[b]
 
 
+# --------------------------------------------------------------------------
+# sparse_attn_indexer integration: parity with persistent_topk on the V4
+# indexer decode shapes. This is the contract the wire-up depends on — the
+# kernel must produce the same top-512 set as the existing path.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("config", [
+    # (B, next_n, L, label). L is max compressed seq_len. Bounded above by
+    # max_model_len/compress_ratio: ~1024 for C128A, ~32768 for C4A.
+    pytest.param((1, 1, 1024), id="c128a_short"),
+    pytest.param((8, 1, 1024), id="c128a_b8"),
+    pytest.param((16, 1, 1024), id="c128a_b16"),
+    pytest.param((32, 1, 1024), id="c128a_b32"),
+    pytest.param((1, 1, 32768), id="c4a_long"),
+    pytest.param((8, 1, 32768), id="c4a_b8"),
+    pytest.param((4, 4, 4096), id="c4a_native_mtp"),  # 2D seq_lens
+])
+def test_indexer_dispatch_matches_persistent_topk(config):
+    """The wired _run_fast_topk_v2 must produce the same top-512 set as the
+    fallback torch.ops._C.persistent_topk on every shape the V4 decode path
+    actually feeds it."""
+    from vllm.model_executor.layers.sparse_attn_indexer import (
+        RADIX_TOPK_WORKSPACE_SIZE,
+        _can_use_fast_topk_v2,
+        _run_fast_topk_v2,
+    )
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        init_workspace_manager,
+        is_workspace_manager_initialized,
+    )
+
+    if not _can_use_fast_topk_v2(512):
+        pytest.skip("fast_topk_v2 not callable in this environment")
+
+    device = torch.device("cuda")
+    if not is_workspace_manager_initialized():
+        init_workspace_manager(device=device, num_ubatches=1)
+    wsm = current_workspace_manager()
+
+    B, next_n, L = config
+    num_rows = B * next_n
+    L_aligned = (L + 3) & ~3
+
+    torch.manual_seed(B * next_n * L)
+    logits = torch.randn(num_rows, L_aligned, dtype=torch.float32,
+                         device=device)
+    seq_lens_2d = torch.randint(1, L + 1, (B, next_n), dtype=torch.int32,
+                                device=device)
+
+    out_v2 = torch.full((num_rows, TOPK), -1, dtype=torch.int32, device=device)
+    _run_fast_topk_v2(logits, seq_lens_2d, out_v2, wsm)
+
+    out_ref = torch.full((num_rows, TOPK), -1, dtype=torch.int32, device=device)
+    (workspace,) = wsm.get_simultaneous(
+        ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8))
+    torch.ops._C.persistent_topk(logits, seq_lens_2d, out_ref, workspace,
+                                 TOPK, L_aligned)
+    torch.cuda.synchronize()
+
+    flat_seq_lens = seq_lens_2d.reshape(-1)
+    for r in range(num_rows):
+        sl = int(flat_seq_lens[r])
+        valid = min(sl, TOPK)
+        v2 = set(out_v2[r, :valid].tolist()) - {-1}
+        ref = set(out_ref[r, :valid].tolist()) - {-1}
+        assert v2 == ref, (
+            f"row {r} sl={sl}: v2 has {len(v2 - ref)} not in ref, "
+            f"ref has {len(ref - v2)} not in v2")
+        if sl < TOPK:
+            assert (out_v2[r, sl:] == -1).all(), f"row {r}: pad violated"
+
+
 def test_workspace_can_be_preallocated():
     """Workspace passed in by the caller (cudagraph-friendly path)."""
     torch.manual_seed(0)
@@ -354,3 +429,80 @@ def test_workspace_can_be_preallocated():
     expected = _reference_topk(scores, seq_lens, page_table, page_size=1)
     for b in range(B):
         assert set(out[b].tolist()) == expected[b]
+
+
+# --------------------------------------------------------------------------
+# Raw output path (no page-table fold-in). Same selection algorithm; just
+# emits row-local raw indices straight to the output. Used by
+# sparse_attn_indexer.py as a drop-in for persistent_topk.
+# --------------------------------------------------------------------------
+
+
+def _reference_topk_raw(scores, seq_lens):
+    """Per-row reference: row-local raw top-k indices, no page resolution."""
+    B = scores.shape[0]
+    out = []
+    for b in range(B):
+        sl = int(seq_lens[b])
+        if sl <= TOPK:
+            out.append(set(range(sl)))
+        else:
+            _, raw = torch.topk(scores[b, :sl], TOPK)
+            out.append(set(raw.tolist()))
+    return out
+
+
+@pytest.mark.parametrize("seq_len", [
+    pytest.param(300, id="trivial"),
+    pytest.param(2048, id="register_1p"),
+    pytest.param(SMALL_2PASS - 1, id="register_2p"),
+    pytest.param(40000, id="streaming"),
+])
+def test_raw_path_simple_shapes(seq_len):
+    """fast_topk_v2_raw on simple paths."""
+    torch.manual_seed(seq_len)
+    device = torch.device("cuda")
+    B = 4
+    L = (seq_len + 3) & ~3
+    scores = torch.randn(B, L, dtype=torch.float32, device=device)
+    seq_lens = torch.full((B,), seq_len, dtype=torch.int32, device=device)
+    indices = fast_topk_v2_raw(scores, seq_lens)
+    torch.cuda.synchronize()
+    expected = _reference_topk_raw(scores, seq_lens)
+    for b in range(B):
+        sl = int(seq_lens[b])
+        valid = min(sl, TOPK)
+        row = indices[b].tolist()
+        if sl < TOPK:
+            assert all(v == -1 for v in row[sl:])
+        got = set(row[:valid]) - {-1}
+        assert got == expected[b], (
+            f"row {b} sl={sl}: missing={len(expected[b] - got)} "
+            f"extra={len(got - expected[b])}")
+
+
+def test_raw_path_matches_paged_with_identity_table():
+    """Equivalence: fast_topk_v2_raw should produce the same output as
+    fast_topk_v2 with page_size=1 + identity page_table (the workaround
+    we previously used). This guarantees the raw path doesn't drift from
+    the paged one."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    B, seq_len = 8, 8192
+    L = (seq_len + 3) & ~3
+    scores = torch.randn(B, L, dtype=torch.float32, device=device)
+    seq_lens = torch.full((B,), seq_len, dtype=torch.int32, device=device)
+
+    # Raw path
+    raw_out = fast_topk_v2_raw(scores, seq_lens)
+
+    # Paged path with page_size=1 + identity table
+    identity_pt = (torch.arange(L, dtype=torch.int32, device=device)
+                   .unsqueeze(0).expand(B, L))
+    paged_out = fast_topk_v2(scores, seq_lens, identity_pt, page_size=1)
+    torch.cuda.synchronize()
+
+    # Per-row sets should match (top-k order may differ).
+    for b in range(B):
+        assert set(raw_out[b].tolist()) == set(paged_out[b].tolist()), (
+            f"row {b}: raw and paged-with-identity emitted different sets")
