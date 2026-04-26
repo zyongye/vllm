@@ -143,7 +143,7 @@ fused_add_rms_norm_static_fp8_quant_kernel(
       float wf = Converter::convert(w.data[i]);
       // See note in rms_norm_static_fp8_quant_kernel: round through scalar_t
       // to match the unfused composite path at FP8 boundaries.
-      scalar_t out_norm = Converter::convert(x * s_variance * wf);
+      scalar_t out_norm = static_cast<scalar_t>(x * s_variance * wf);
       out[id * width + i] = scaled_fp8_conversion<true, fp8_type>(
           static_cast<float>(out_norm), scale_inv);
     }
