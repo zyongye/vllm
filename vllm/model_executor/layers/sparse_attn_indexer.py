@@ -36,70 +36,6 @@ logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
-# Per-call workspace size for fast_topk_v2 (Hopper / Blackwell-DC). The kernel
-# stages cluster ties through `(B, kWorkspaceInts)` int32, where kWorkspaceInts
-# is set by the kernel (currently 2050 = 8200 bytes per row). The op is
-# registered with CompositeExplicitAutograd so the call is cheap; this stays
-# safe even when the kernel was not compiled (e.g., on non-supported arches —
-# we just won't take this branch).
-_FAST_TOPK_V2_WORKSPACE_INTS: int | None = None
-
-
-def _fast_topk_v2_workspace_ints() -> int:
-    """Cached lookup of the kernel's per-row workspace size in int32s."""
-    global _FAST_TOPK_V2_WORKSPACE_INTS
-    if _FAST_TOPK_V2_WORKSPACE_INTS is None:
-        _FAST_TOPK_V2_WORKSPACE_INTS = int(
-            torch.ops._C.fast_topk_v2_workspace_ints()
-        )
-    return _FAST_TOPK_V2_WORKSPACE_INTS
-
-
-# Persistent "no cluster" metadata: pre-filled once (during the first call
-# on a given device, before any cudagraph capture) and reused across every
-# forward. Slicing returns a view, so the data pointer is stable even when
-# the live batch size shrinks. This lets us skip the plan kernel entirely
-# on the hot path — safe because the V4 indexer's compressed L is bounded
-# by max_model_len/compress_ratio (<= 32768), well below the planner's
-# kMaxSupportedLength=262144 ceiling, so the planner would always emit the
-# same constant ("no cluster items, threshold = max"). Keyed by device
-# index; sized to a generous worst case to avoid reallocating mid-run
-# (which would invalidate cudagraph captures pinned to the old pointer).
-_NO_CLUSTER_METADATA_CACHE: dict[int, torch.Tensor] = {}
-_NO_CLUSTER_METADATA_INITIAL_BATCH = 8192
-
-
-def _no_cluster_metadata(
-    batch_size: int, device: torch.device
-) -> torch.Tensor:
-    """Return a (batch_size + 1, 4) int32 view of a cached metadata buffer
-    pre-filled to disable the cluster path. The underlying tensor is
-    allocated lazily on first call and never freed."""
-    from vllm.v1.attention.ops.deepseek_v4_ops.fast_topk import (
-        make_no_cluster_metadata,
-    )
-
-    dev_idx = device.index if device.index is not None else 0
-    base = _NO_CLUSTER_METADATA_CACHE.get(dev_idx)
-    if base is None or base.size(0) < batch_size + 1:
-        # Grow generously to avoid repeated reallocation (each realloc
-        # invalidates any cudagraph captures that pinned the old pointer).
-        new_max = max(
-            batch_size,
-            _NO_CLUSTER_METADATA_INITIAL_BATCH,
-            base.size(0) * 2 if base is not None else 0,
-        )
-        if base is not None:
-            logger.warning_once(
-                "Growing fast_topk_v2 no-cluster metadata cache from %d "
-                "to %d rows; any prior cudagraphs that captured this op "
-                "will need to be re-captured.",
-                base.size(0) - 1, new_max,
-            )
-        base = make_no_cluster_metadata(new_max, device)
-        _NO_CLUSTER_METADATA_CACHE[dev_idx] = base
-    return base[: batch_size + 1]
-
 
 def _can_use_fast_topk_v2(topk_tokens: int) -> bool:
     """Hopper / Blackwell-DC + k=512 (DeepSeek V4 indexer) gates the path."""
@@ -113,45 +49,6 @@ def _can_use_fast_topk_v2(topk_tokens: int) -> bool:
     if major == 10 and minor in (0, 3):
         return True
     return False
-
-
-def _run_fast_topk_v2(
-    logits: torch.Tensor,
-    seq_lens: torch.Tensor,
-    topk_indices: torch.Tensor,
-    workspace_manager,
-) -> None:
-    """Run fast_topk_v2_raw in place of persistent_topk.
-
-    Output semantics match persistent_topk: ``topk_indices[b, j]`` is the
-    raw column index in ``logits[b]`` of the j-th largest score, with -1
-    padding when ``seq_lens[b] < 512``. Uses the kernel's raw-output path
-    (no page-table fold-in) so we don't need to ship an identity page
-    table.
-
-    The plan kernel is **not** invoked on the hot path. The V4 indexer's
-    compressed L is bounded by max_model_len/compress_ratio (≤ 32768),
-    well under the planner's kMaxSupportedLength ceiling, so the planner
-    would always emit the same constant metadata (no cluster items,
-    threshold = max). We pre-fill that constant once into a module-level
-    buffer and reuse it across every forward — see _no_cluster_metadata.
-    """
-    # fast_topk_v2 needs 1D seq_lens; the indexer holds 2D (B, next_n) for
-    # native MTP. Flatten — view is fine since the buffer is contiguous.
-    flat_seq_lens = seq_lens.reshape(-1)
-    num_rows, _ = logits.shape
-
-    metadata = _no_cluster_metadata(num_rows, logits.device)
-    (workspace,) = workspace_manager.get_simultaneous(
-        ((num_rows, _fast_topk_v2_workspace_ints()), torch.int32),
-    )
-    torch.ops._C.fast_topk_v2_raw(
-        logits,
-        flat_seq_lens,
-        topk_indices,
-        workspace,
-        metadata,
-    )
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -440,13 +337,20 @@ def sparse_attn_indexer(
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
         if _can_use_fast_topk_v2(topk_tokens):
-            # DeepSeek V4 (k=512) on Hopper / Blackwell-DC: ported sglang
-            # topk_v2 family. ~1.4-3.9x faster than persistent_topk for the
-            # B/L combinations the V4 indexer actually sees (max compressed
-            # L = max_model_len / compress_ratio, so ~1K for C128A and ~32K
-            # for C4A). See benchmarks/kernels/benchmark_fast_topk_v2.py.
-            _run_fast_topk_v2(
-                logits, seq_lens, topk_indices, current_workspace_manager()
+            from vllm.v1.attention.ops.deepseek_v4_ops.fast_topk import (
+                fast_topk_v2_raw,
+                plan_topk_v2,
+            )
+            fast_topk_v2_metadata = getattr(attn_metadata, "fast_topk_v2_metadata", None)
+            seq_lens_flat = seq_lens.reshape(-1)
+            if fast_topk_v2_metadata is None:
+                fast_topk_v2_metadata = plan_topk_v2(seq_lens_flat)
+                attn_metadata.fast_topk_v2_metadata = fast_topk_v2_metadata
+            fast_topk_v2_raw(
+                logits,
+                seq_lens_flat,
+                metadata=fast_topk_v2_metadata,
+                topk_indices=topk_indices,
             )
         elif current_platform.is_cuda() and topk_tokens in (512, 2048):
             workspace_manager = current_workspace_manager()

@@ -30,61 +30,30 @@ _PLAN_COLS = 4
 # Output top-k size. Hardcoded in the kernel.
 _TOPK = 512
 
-# kMaxSupportedLength from csrc/deepseek_v4/fast_topk_v2.cu — the largest
-# value the auto planner can ever pick for `cluster_threshold`. When every
-# row's seq_len is bounded by this, the kernel never needs the cluster path
-# and the plan kernel is a no-op (it always emits zero cluster items). This
-# is the case for the V4 indexer, where max compressed L is bounded by
-# max_model_len / compress_ratio (≤ 32768 even for max_model_len=131072
-# with compress_ratio=4).
-_NO_CLUSTER_THRESHOLD = 262144
+# Hard upper bound on per-row seq_len. Mirrors kMaxSupportedLength in
+# csrc/deepseek_v4/fast_topk_v2.cu (= ClusterTopK::kMaxLength). For V4 C4A
+# with max_model_len <= 1M this is 256K compressed and stays inside this
+# bound.
+MAX_SUPPORTED_LEN: int = 262144
+
+_WORKSPACE_INTS_PER_BATCH: int | None = None
 
 
 def workspace_ints_per_batch() -> int:
-    """Number of int32s the kernel needs in `(B, _)` workspace per row."""
-    return int(torch.ops._C.fast_topk_v2_workspace_ints())
-
-
-def make_no_cluster_metadata(
-    max_batch_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Build a persistent metadata tensor that disables the cluster path.
-
-    For callers that can guarantee every row's seq_len is <= 262144
-    (kMaxSupportedLength), the planner's output is invariant: cluster
-    threshold = max, num_cluster_items = 0. This helper materializes that
-    constant metadata once so the caller can skip plan_topk_v2 on the
-    forward path.
-
-    Args:
-        max_batch_size: largest batch size that will ever be passed to
-            fast_topk_v2 with this metadata. The returned tensor has
-            ``shape (max_batch_size + 1, 4)``; callers slice it to
-            ``[:current_batch_size + 1]`` per call (the slice is a view, so
-            its data pointer matches the cache and is cudagraph-stable).
-        device: target CUDA device.
-
-    Returns:
-        ``(max_batch_size + 1, 4)`` int32 tensor on ``device``. Row 0 holds
-        the GlobalMetadata layout {cluster_threshold, num_cluster_items, 0,
-        0}; subsequent rows are zero-filled sentinels. Safe to share across
-        any seq_lens distribution where all values are
-        <= ``_NO_CLUSTER_THRESHOLD`` (262144).
-    """
-    metadata = torch.zeros(
-        max_batch_size + 1, _PLAN_COLS, dtype=torch.int32, device=device
-    )
-    # GlobalMetadata layout: { cluster_threshold, num_cluster_items, ... }
-    metadata[0, 0] = _NO_CLUSTER_THRESHOLD
-    # metadata[0, 1] = 0 (num_cluster_items, already zero)
-    return metadata
+    """Number of int32s the kernel needs in ``(B, _)`` workspace per row.
+    Cached after the first call; the value is a kernel-wide constant."""
+    global _WORKSPACE_INTS_PER_BATCH
+    if _WORKSPACE_INTS_PER_BATCH is None:
+        _WORKSPACE_INTS_PER_BATCH = int(
+            torch.ops._C.fast_topk_v2_workspace_ints()
+        )
+    return _WORKSPACE_INTS_PER_BATCH
 
 
 def plan_topk_v2(
     seq_lens: torch.Tensor,
     static_cluster_threshold: int = 0,
-    metadata: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pick a per-batch ``cluster_threshold`` and build the per-row metadata.
 
@@ -95,7 +64,7 @@ def plan_topk_v2(
         static_cluster_threshold: when nonzero, override the auto-tuned
             threshold and route any row with ``seq_len > threshold`` through
             the cluster path. 0 means auto.
-        metadata: optional preallocated int32 tensor of shape ``(B + 1, 4)``.
+        out: optional preallocated int32 tensor of shape ``(B + 1, 4)``.
             When provided, the planner writes into it (useful for cudagraph
             capture). When omitted, a fresh tensor is allocated.
 
@@ -107,28 +76,21 @@ def plan_topk_v2(
     assert seq_lens.is_cuda and seq_lens.is_contiguous()
 
     batch_size = seq_lens.size(0)
-    if metadata is None:
-        metadata = torch.empty(
-            (batch_size + 1, _PLAN_COLS),
-            dtype=torch.int32,
-            device=seq_lens.device,
-        )
-    else:
-        assert metadata.shape == (batch_size + 1, _PLAN_COLS)
-        assert metadata.dtype == torch.int32
-        assert metadata.is_cuda and metadata.is_contiguous()
+    if out is None:
+        out = torch.empty(
+            batch_size + 1, _PLAN_COLS, dtype=torch.int32, device=seq_lens.device)
 
     torch.ops._C.fast_topk_v2_plan(
-        seq_lens, metadata, int(static_cluster_threshold)
+        seq_lens, out, int(static_cluster_threshold)
     )
-    return metadata
+    return out
 
 
 def fast_topk_v2_raw(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
     *,
-    metadata: Optional[torch.Tensor] = None,
+    metadata: torch.Tensor | None = None,
     workspace: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -143,8 +105,9 @@ def fast_topk_v2_raw(
     Args:
         scores: float32 ``(B, L)``, ``stride(-1)==1``, ``stride(0) % 4 == 0``.
         seq_lens: int32 ``(B,)``.
-        metadata: optional plan tensor from :func:`plan_topk_v2`. If omitted,
-            it is built on the fly.
+        metadata: optional preallocated int32 tensor of shape ``(B + 1, 4)``.
+            When provided, the planner writes into it (useful for cudagraph
+            capture). When omitted, a fresh tensor is allocated.
         workspace: optional preallocated ``(B, workspace_ints_per_batch())``
             int32, ``stride(-1) == 1``.
         topk_indices: optional preallocated output ``(B, 512)`` int32
@@ -159,6 +122,9 @@ def fast_topk_v2_raw(
     assert scores.is_cuda
     batch_size = scores.size(0)
 
+    if metadata is None:
+        metadata = plan_topk_v2(seq_lens)
+
     if topk_indices is None:
         topk_indices = scores.new_empty(
             (batch_size, _TOPK), dtype=torch.int32
@@ -167,8 +133,6 @@ def fast_topk_v2_raw(
         workspace = scores.new_empty(
             (batch_size, workspace_ints_per_batch()), dtype=torch.int32
         )
-    if metadata is None:
-        metadata = plan_topk_v2(seq_lens)
 
     torch.ops._C.fast_topk_v2_raw(
         scores, seq_lens, topk_indices, workspace, metadata,
@@ -182,7 +146,7 @@ def fast_topk_v2(
     page_table: torch.Tensor,
     page_size: int,
     *,
-    metadata: Optional[torch.Tensor] = None,
+    metadata: torch.Tensor | None = None,
     workspace: Optional[torch.Tensor] = None,
     page_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -195,8 +159,9 @@ def fast_topk_v2(
             considered for row b.
         page_table: int32 ``(B, max_blocks)`` with ``stride(-1) == 1``.
         page_size: power-of-2 page size used by the indexer KV cache.
-        metadata: optional plan tensor from :func:`plan_topk_v2`. If omitted,
-            it is built on the fly.
+        metadata: optional preallocated int32 tensor of shape ``(B + 1, 4)``.
+            When provided, the planner writes into it (useful for cudagraph
+            capture). When omitted, a fresh tensor is allocated.
         workspace: optional preallocated workspace ``(B, workspace_ints_per_batch())``
             int32, ``stride(-1) == 1``. Used for inter-cluster tie staging in
             the large-N path. Allocated on demand if absent.
@@ -211,6 +176,11 @@ def fast_topk_v2(
     assert scores.is_cuda
     batch_size = scores.size(0)
 
+    if metadata is None:
+        metadata = plan_topk_v2(seq_lens)
+    else:
+        metadata = metadata[: batch_size + 1]
+
     if page_indices is None:
         page_indices = scores.new_empty(
             (batch_size, _TOPK), dtype=torch.int32
@@ -219,9 +189,6 @@ def fast_topk_v2(
         workspace = scores.new_empty(
             (batch_size, workspace_ints_per_batch()), dtype=torch.int32
         )
-    if metadata is None:
-        metadata = plan_topk_v2(seq_lens)
-
     torch.ops._C.fast_topk_v2(
         scores,
         seq_lens,

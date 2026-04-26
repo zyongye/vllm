@@ -339,6 +339,23 @@ def test_metadata_can_be_reused_across_calls():
 # --------------------------------------------------------------------------
 
 
+@pytest.fixture
+def _metadata_cache_seeded():
+    """Pre-populate the fast_topk_v2 metadata scratch for the device under
+    test. Mirrors what DeepseekV4Model.__init__ does in production. We
+    clear before/after so each parametrized case starts from a clean
+    slate."""
+    from vllm.v1.attention.ops.deepseek_v4_ops.fast_topk import (
+        _METADATA_CACHE, init_metadata_buffer,
+    )
+    _METADATA_CACHE.clear()
+    # Sized for any batch this test file will throw at it. In production
+    # this would be scheduler_config.max_num_batched_tokens.
+    init_metadata_buffer(8192, torch.device("cuda"))
+    yield
+    _METADATA_CACHE.clear()
+
+
 @pytest.mark.parametrize("config", [
     # (B, next_n, L, label). L is max compressed seq_len. Bounded above by
     # max_model_len/compress_ratio: ~1024 for C128A, ~32768 for C4A.
@@ -350,14 +367,16 @@ def test_metadata_can_be_reused_across_calls():
     pytest.param((8, 1, 32768), id="c4a_b8"),
     pytest.param((4, 4, 4096), id="c4a_native_mtp"),  # 2D seq_lens
 ])
-def test_indexer_dispatch_matches_persistent_topk(config):
-    """The wired _run_fast_topk_v2 must produce the same top-512 set as the
-    fallback torch.ops._C.persistent_topk on every shape the V4 decode path
-    actually feeds it."""
+def test_indexer_dispatch_matches_persistent_topk(config,
+                                                  _metadata_cache_seeded):
+    """The dispatch path the indexer takes for V4 (plan once + raw kernel)
+    must produce the same top-512 set as the fallback persistent_topk on
+    every shape the V4 decode path actually feeds it."""
     from vllm.model_executor.layers.sparse_attn_indexer import (
-        RADIX_TOPK_WORKSPACE_SIZE,
-        _can_use_fast_topk_v2,
-        _run_fast_topk_v2,
+        RADIX_TOPK_WORKSPACE_SIZE, _can_use_fast_topk_v2,
+    )
+    from vllm.v1.attention.ops.deepseek_v4_ops.fast_topk import (
+        get_metadata_buffer,
     )
     from vllm.v1.worker.workspace import (
         current_workspace_manager,
@@ -383,13 +402,24 @@ def test_indexer_dispatch_matches_persistent_topk(config):
     seq_lens_2d = torch.randint(1, L + 1, (B, next_n), dtype=torch.int32,
                                 device=device)
 
+    # Mirror the production flow: plan once (DeepseekV4Model.forward), then
+    # the indexer dispatch calls fast_topk_v2_raw with the pre-planned
+    # metadata buffer.
     out_v2 = torch.full((num_rows, TOPK), -1, dtype=torch.int32, device=device)
-    _run_fast_topk_v2(logits, seq_lens_2d, out_v2, wsm)
+    metadata = get_metadata_buffer(num_rows, device)
+    torch.ops._C.fast_topk_v2_plan(seq_lens_2d.reshape(-1), metadata, 0)
+    (workspace,) = wsm.get_simultaneous(
+        ((num_rows, workspace_ints_per_batch()), torch.int32),
+    )
+    fast_topk_v2_raw(
+        logits, seq_lens_2d.reshape(-1),
+        metadata=metadata, workspace=workspace, topk_indices=out_v2,
+    )
 
     out_ref = torch.full((num_rows, TOPK), -1, dtype=torch.int32, device=device)
-    (workspace,) = wsm.get_simultaneous(
+    (ref_workspace,) = wsm.get_simultaneous(
         ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8))
-    torch.ops._C.persistent_topk(logits, seq_lens_2d, out_ref, workspace,
+    torch.ops._C.persistent_topk(logits, seq_lens_2d, out_ref, ref_workspace,
                                  TOPK, L_aligned)
     torch.cuda.synchronize()
 

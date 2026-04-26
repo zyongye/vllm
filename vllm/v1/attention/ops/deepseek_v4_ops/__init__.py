@@ -8,9 +8,10 @@ from .cache_utils import (
     quantize_and_insert_k_cache,
 )
 from .fast_topk import (
+    MAX_SUPPORTED_LEN,
     fast_topk_v2,
     fast_topk_v2_raw,
-    make_no_cluster_metadata,
+    allocate_fast_topk_v2_metadata_buffer,
     plan_topk_v2,
     workspace_ints_per_batch,
 )
@@ -19,6 +20,7 @@ from .fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
 from .fused_qk_rmsnorm import fused_q_kv_rmsnorm
 
 __all__ = [
+    "MAX_SUPPORTED_LEN",
     "MXFP4_BLOCK_SIZE",
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
@@ -28,7 +30,7 @@ __all__ = [
     "fused_indexer_q_rope_quant",
     "fused_inv_rope_fp8_quant",
     "fused_q_kv_rmsnorm",
-    "make_no_cluster_metadata",
+    "allocate_fast_topk_v2_metadata_buffer",
     "plan_topk_v2",
     "quantize_and_insert_k_cache",
     "workspace_ints_per_batch",
