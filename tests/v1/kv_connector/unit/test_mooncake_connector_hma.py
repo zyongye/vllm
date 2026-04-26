@@ -208,7 +208,6 @@ def test_metadata_hma_block_ids():
 # ---------------------------------------------------------------------------
 #  test_build_transfer_params_multi_group_trimming
 # ---------------------------------------------------------------------------
-@pytest.mark.cpu_test
 @pytest.mark.asyncio
 @patch(
     "vllm.distributed.kv_transfer.kv_connector.v1.mooncake"
@@ -292,7 +291,6 @@ async def test_build_transfer_params_multi_group_trimming(monkeypatch):
 # ---------------------------------------------------------------------------
 #  test_build_transfer_params_group_count_mismatch
 # ---------------------------------------------------------------------------
-@pytest.mark.cpu_test
 @pytest.mark.asyncio
 @patch(
     "vllm.distributed.kv_transfer.kv_connector.v1.mooncake"
@@ -300,7 +298,7 @@ async def test_build_transfer_params_multi_group_trimming(monkeypatch):
     FakeMooncakeWrapper,
 )
 async def test_build_transfer_params_group_count_mismatch(monkeypatch):
-    """_build_transfer_params asserts when group counts differ."""
+    """_build_transfer_params reports an error when group counts differ."""
 
     monkeypatch.setenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "5")
     vllm_config = create_vllm_config(
@@ -346,10 +344,22 @@ async def test_build_transfer_params_group_count_mismatch(monkeypatch):
         ]
 
         ready_reqs = [("d-mismatch", send_meta)]
-        with pytest.raises(AssertionError, match="KV group count mismatch"):
-            await worker._build_transfer_params(
-                ready_reqs, xfer_meta, local_regions, remote_regions
-            )
+        (
+            src_ptrs,
+            dst_ptrs,
+            lengths,
+            err_reqs,
+            err_msg,
+        ) = await worker._build_transfer_params(
+            ready_reqs, xfer_meta, local_regions, remote_regions
+        )
+
+        # Mismatched req is reported via err_reqs/err_msg with no transfers built.
+        assert err_reqs == ["d-mismatch"]
+        assert err_msg == "KV group count mismatch"
+        assert src_ptrs == []
+        assert dst_ptrs == []
+        assert lengths == []
 
         worker.shutdown()
 
