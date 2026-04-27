@@ -410,11 +410,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.kv_norm.weight.data,
             self.eps,
         )
-        q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
 
-        # Overlap kv_insert with whichever of indexer/compressor is present.
-        # Indexer implies compressor; when both exist, compressor rides on the
-        # aux stream alongside kv_insert so the heavy indexer owns default.
+        # Overlap wq_b + kv_insert (+ compressor when indexer is present) on
+        # the aux stream with indexer/compressor on default. q flows out via
+        # event1 sync.
         if self.indexer is not None:
             assert self.aux_stream_list is not None
             aux_stream = self.aux_stream_list[0]
@@ -423,40 +422,47 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             assert self.compressor is not None
             compressor = self.compressor
 
-            def kv_insert_and_compress() -> None:
+            def wq_b_kv_insert_and_compress() -> torch.Tensor:
+                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
                 self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 compressor(kv_score, positions, self.rotary_emb)
+                return q
 
-            maybe_execute_in_parallel(
+            _, q = maybe_execute_in_parallel(
                 lambda: indexer(
                     hidden_states,
-                    q,
+                    qr,
                     indexer_kv_score,
                     indexer_weights,
                     positions,
                     self.indexer_rotary_emb,
                 ),
-                kv_insert_and_compress,
+                wq_b_kv_insert_and_compress,
                 self.ln_events[0],
                 self.ln_events[1],
                 aux_stream,
             )
         elif self.compressor is not None:
-            # Compressor on default, kv_insert on aux.
+            # Compressor on default, wq_b + kv_insert on aux.
             assert self.aux_stream_list is not None
             aux_stream = self.aux_stream_list[0]
             compressor = self.compressor
-            maybe_execute_in_parallel(
+
+            def wq_b_kv_insert() -> torch.Tensor:
+                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+                return q
+
+            _, q = maybe_execute_in_parallel(
                 lambda: compressor(kv_score, positions, self.rotary_emb),
-                lambda: self._fused_qnorm_rope_kv_insert(
-                    q, kv, positions, attn_metadata
-                ),
+                wq_b_kv_insert,
                 self.ln_events[0],
                 self.ln_events[1],
                 aux_stream,
             )
         else:
             # SWA-only layer: no compressor, no overlap.
+            q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
             self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
         # Handle dummy run (no metadata).
@@ -1123,12 +1129,14 @@ class DeepseekV4Indexer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        q: torch.Tensor,
+        qr: torch.Tensor,
         compressed_kv_score: torch.Tensor,
         indexer_weights: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
     ) -> torch.Tensor:
+        # ReplicatedLinear returns (output, bias); bias is None.
+        q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
         k = self.compressor(compressed_kv_score, positions, rotary_emb)
         q_quant, weights = fused_indexer_q_rope_quant(
