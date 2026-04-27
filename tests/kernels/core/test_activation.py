@@ -112,8 +112,86 @@ def test_act_and_mul(
         opcheck(fn, (out, x, threshold))
     elif activation == "swigluoai_and_mul":
         opcheck(fn, (out, x, layer.alpha, layer.limit))
+    elif activation == "silu_and_mul":
+        opcheck(fn, (out, x, 0.0))
     elif activation != "swiglustep_and_mul":
         opcheck(fn, (out, x))
+
+
+SWIGLU_LIMITS = [3.0, 7.0, 15.0]
+
+
+@pytest.mark.parametrize("swiglu_limit", SWIGLU_LIMITS)
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@pytest.mark.parametrize("d", D)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_silu_and_mul_clamp(
+    default_vllm_config,
+    swiglu_limit: float,
+    num_tokens: int,
+    d: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: str,
+) -> None:
+    """SiluAndMul with swiglu_limit: cuda kernel must match native reference."""
+    set_random_seed(seed)
+    torch.set_default_device(device)
+    # Use large values to ensure clamping is exercised.
+    x = torch.randn(num_tokens, 2 * d, dtype=dtype) * swiglu_limit * 2
+
+    layer = SiluAndMul(compile_native=False, swiglu_limit=swiglu_limit)
+    out = layer(x)
+    ref_out = layer.forward_native(x)
+
+    rtol = {
+        torch.float16: 2e-3,
+        torch.bfloat16: 2e-2,
+        torch.float: 1.3e-6,
+    }
+    torch.testing.assert_close(
+        out, ref_out, atol=get_default_atol(out), rtol=rtol[out.dtype]
+    )
+
+    # Verify clamping is actually being applied: the clamped output should
+    # differ from the unclamped output when inputs are large.
+    unclamped_out = SiluAndMul(compile_native=False).forward_native(x)
+    assert not torch.equal(ref_out.float(), unclamped_out.float()), (
+        "Input was not large enough to exercise the clamp; increase scale"
+    )
+
+    # Verify gate clamping semantics with a controlled scalar case.
+    # silu(large_val) >> swiglu_limit, so after clamp(max=limit) * 1.0 == limit.
+    x_gate = torch.tensor(
+        [[swiglu_limit * 20.0, 1.0]], dtype=torch.float32, device=device
+    )
+    out_gate = SiluAndMul(compile_native=False, swiglu_limit=swiglu_limit)(x_gate)
+    torch.testing.assert_close(
+        out_gate,
+        torch.tensor([[swiglu_limit]], dtype=torch.float32, device=device),
+        atol=1e-3,
+        rtol=1e-3,
+    )
+
+    # Verify up clamping semantics: up >> limit gets clamped to limit.
+    x_up = torch.tensor(
+        [[1.0, swiglu_limit * 20.0]], dtype=torch.float32, device=device
+    )
+    out_up = SiluAndMul(compile_native=False, swiglu_limit=swiglu_limit)(x_up)
+    silu_1 = torch.nn.functional.silu(torch.tensor(1.0)).item()
+    torch.testing.assert_close(
+        out_up,
+        torch.tensor([[silu_1 * swiglu_limit]], dtype=torch.float32, device=device),
+        atol=1e-3,
+        rtol=1e-3,
+    )
+
+    # opcheck
+    out_buf = torch.empty(x.shape[:-1] + (d,), dtype=dtype, device=device)
+    opcheck(torch.ops._C.silu_and_mul, (out_buf, x, swiglu_limit))
 
 
 @pytest.mark.parametrize(
