@@ -66,7 +66,7 @@ from .utils import (
 )
 
 
-class DeepSeekV4MLP(nn.Module):
+class DeepseekV4MLP(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -723,7 +723,7 @@ class DeepseekV4MoE(nn.Module):
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
 
-            self.shared_experts = DeepSeekV4MLP(
+            self.shared_experts = DeepseekV4MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,

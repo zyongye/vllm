@@ -120,6 +120,11 @@ class SiluAndMul(CustomOp):
 
     The function computes x -> silu(x[:d]) * x[d:] where d = x.shape[-1] // 2.
 
+    When swiglu_limit is set, inputs are clamped before the activation:
+        gate = clamp(x[:d], max=swiglu_limit)
+        up   = clamp(x[d:], min=-swiglu_limit, max=swiglu_limit)
+        out  = silu(gate) * up
+
     Shapes:
         x: (num_tokens, 2 * d) or (batch_size, seq_len, 2 * d)
         return: (num_tokens, d) or (batch_size, seq_len, d)

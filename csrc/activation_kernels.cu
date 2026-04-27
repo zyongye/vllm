@@ -198,8 +198,9 @@ packed_gelu_tanh_kernel(const packed_t& val) {
 
 // Launch activation and gating kernel.
 // Use ACT_FIRST (bool) indicating whether to apply the activation function
-// first. HAS_CLAMP (bool) enables clamping of gate (post-activation, max only)
-// and up (both sides) by LIMIT.
+// first. HAS_CLAMP (bool) enables pre-activation clamping: gate input is
+// clamped (max only) and up input is clamped (both sides) before the
+// activation function is applied.
 #define LAUNCH_ACTIVATION_GATE_KERNEL(KERNEL, PACKED_KERNEL, ACT_FIRST,        \
                                       HAS_CLAMP, LIMIT)                        \
   auto dtype = input.scalar_type();                                            \
