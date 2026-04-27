@@ -127,24 +127,32 @@ class SiluAndMul(CustomOp):
 
     # --8<-- [end:silu_and_mul]
 
-    def __init__(self, *, compile_native: bool = True):
+    def __init__(
+        self, *, compile_native: bool = True, swiglu_limit: float | None = None
+    ):
         super().__init__(compile_native=compile_native)
+        self.swiglu_limit = swiglu_limit
         if current_platform.is_cuda_alike() or current_platform.is_xpu():
             self.op = torch.ops._C.silu_and_mul
         elif current_platform.is_cpu():
             self._forward_method = self.forward_native
 
-    @staticmethod
-    def forward_native(x: torch.Tensor) -> torch.Tensor:
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
         d = x.shape[-1] // 2
-        return F.silu(x[..., :d]) * x[..., d:]
+        gate = F.silu(x[..., :d])
+        up = x[..., d:]
+        if self.swiglu_limit is not None:
+            gate = torch.clamp(gate, max=self.swiglu_limit)
+            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+        return gate * up
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        self.op(out, x)
+        limit = self.swiglu_limit if self.swiglu_limit is not None else 0.0
+        self.op(out, x, limit)
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
