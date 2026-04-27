@@ -4,6 +4,7 @@
 DeepseekV4 MLA Attention Layer
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -52,7 +53,10 @@ from vllm.model_executor.layers.quantization.input_quant_fp8 import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
 )
-from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+from vllm.utils.multi_stream_utils import (
+    execute_in_parallel,
+    maybe_execute_in_parallel,
+)
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     DeepseekV4FlashMLASparseBackend,
@@ -219,10 +223,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         self.aux_stream_list = mla_modules.aux_stream_list
-        # ln_events[0..1]: post-GEMM maybe_execute_in_parallel event0/event1.
-        # The GEMM phase synchronizes via stream.wait_stream() (no user-
-        # managed events) so it doesn't share event slots with this pair.
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        # [0]: GEMM start / post-GEMM event0. [1..3]: GEMM done events;
+        # [1] doubles as post-GEMM event1. Reuse is safe: GEMM fully joins
+        # before post-GEMM starts.
+        self.ln_events = [torch.cuda.Event() for _ in range(4)]
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         self.swa_cache_layer = DeepseekV4SWACache(
@@ -335,50 +339,50 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         assert self.aux_stream_list is not None
         assert len(self.aux_stream_list) >= 3
 
-        # Run fused_wqa_wkv (heaviest) on the current (default) stream and the
-        # three lighter input GEMMs on aux streams 0..2 when their owning
-        # module exists. Sync via stream.wait_stream() rather than user-managed
-        # events: a single fan-out barrier (all aux wait_stream(current)) at
-        # the start and a single fan-in barrier (current.wait_stream(each aux))
-        # at the end.
-        current = torch.cuda.current_stream()
-        aux0, aux1, aux2 = (
-            self.aux_stream_list[0],
-            self.aux_stream_list[1],
-            self.aux_stream_list[2],
-        )
-
-        # Fan-out: every aux stream observes default's prior work.
-        aux0.wait_stream(current)
-        aux1.wait_stream(current)
-        aux2.wait_stream(current)
-
-        kv_score: torch.Tensor | None = None
-        indexer_weights: torch.Tensor | None = None
-        indexer_kv_score: torch.Tensor | None = None
+        # fused_wqa_wkv (heaviest) on default; the three lighter input GEMMs
+        # on aux streams 0..2 when their owning module exists. ln_events[0]
+        # is the fan-out start event; ln_events[1..3] are per-aux done events.
+        aux_fns: list[Callable[[], Any] | None] = [None, None, None]
 
         if self.compressor is not None:
-            with torch.cuda.stream(aux0):
-                kv_score = cublas_gemm_bf16_bf16_fp32(
-                    hidden_states, self.compressor.fused_wkv_wgate.weight
+            # Local ref so the closure keeps a non-None type for mypy.
+            compressor = self.compressor
+
+            def compressor_kv_score() -> torch.Tensor:
+                return cublas_gemm_bf16_bf16_fp32(
+                    hidden_states, compressor.fused_wkv_wgate.weight
                 )
+
+            aux_fns[0] = compressor_kv_score
 
         if self.indexer is not None:
-            with torch.cuda.stream(aux1):
+            indexer = self.indexer
+
+            def indexer_weights_proj() -> torch.Tensor:
                 # ReplicatedLinear returns (output, bias); bias is None.
-                indexer_weights, _ = self.indexer.weights_proj(hidden_states)
-            with torch.cuda.stream(aux2):
-                indexer_kv_score = cublas_gemm_bf16_bf16_fp32(
-                    hidden_states, self.indexer.compressor.fused_wkv_wgate.weight
+                weights, _ = indexer.weights_proj(hidden_states)
+                return weights
+
+            def indexer_compressor_kv_score() -> torch.Tensor:
+                return cublas_gemm_bf16_bf16_fp32(
+                    hidden_states, indexer.compressor.fused_wkv_wgate.weight
                 )
 
-        # MergedColumnParallelLinear returns (output, bias); bias is None.
-        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+            aux_fns[1] = indexer_weights_proj
+            aux_fns[2] = indexer_compressor_kv_score
 
-        # Fan-in: default observes every aux stream's outputs.
-        current.wait_stream(aux0)
-        current.wait_stream(aux1)
-        current.wait_stream(aux2)
+        def fused_wqa_wkv() -> torch.Tensor:
+            # MergedColumnParallelLinear returns (output, bias); bias is None.
+            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+            return qr_kv
+
+        qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
+            fused_wqa_wkv,
+            aux_fns,
+            self.ln_events[0],
+            self.ln_events[1:4],
+            self.aux_stream_list[:3],
+        )
 
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
