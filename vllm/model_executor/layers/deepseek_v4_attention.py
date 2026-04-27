@@ -223,13 +223,14 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         self.aux_stream_list = mla_modules.aux_stream_list
-        # ln_events[0]: doubles as the GEMM-phase start event (default stream
-        # → fan-out to all aux streams) and as event0 for the subsequent
-        # maybe_execute_in_parallel call. ln_events[1..3] are the three
-        # GEMM-phase done events; ln_events[1] is also reused as event1 for
-        # maybe_execute_in_parallel since the GEMM phase has fully joined
-        # before that call.
-        self.ln_events = [torch.cuda.Event() for _ in range(4)]
+        # gemm_events[0]: GEMM-phase start (default → fan-out to aux 0..2).
+        # gemm_events[1..3]: per-aux done events (aux i → default).
+        # ln_events[0..1]: post-GEMM maybe_execute_in_parallel event0/event1.
+        # Disjoint sets — re-recording the same event twice in a single
+        # forward (and hence a single CUDA graph capture) can cause
+        # graph-edge ambiguity and hangs on first launch.
+        self.gemm_events = [torch.cuda.Event() for _ in range(4)]
+        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         self.swa_cache_layer = DeepseekV4SWACache(
@@ -343,8 +344,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         assert len(self.aux_stream_list) >= 3
 
         # fused_wqa_wkv (heaviest) on default; the three lighter input GEMMs
-        # on aux streams 0..2 when their owning module exists. ln_events[0]
-        # is the fan-out start event; ln_events[1..3] are per-aux done events.
+        # on aux streams 0..2 when their owning module exists. gemm_events[0]
+        # is the fan-out start event; gemm_events[1..3] are per-aux done events.
         aux_fns: list[Callable[[], Any] | None] = [None, None, None]
 
         if self.compressor is not None:
@@ -382,8 +383,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
             fused_wqa_wkv,
             aux_fns,
-            self.ln_events[0],
-            self.ln_events[1:4],
+            self.gemm_events[0],
+            self.gemm_events[1:4],
             self.aux_stream_list[:3],
         )
 
