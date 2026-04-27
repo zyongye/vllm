@@ -139,6 +139,7 @@ class SiluAndMul(CustomOp):
         self.swiglu_limit = swiglu_limit
         if current_platform.is_cuda_alike() or current_platform.is_xpu():
             self.op = torch.ops._C.silu_and_mul
+            self.op_clamp = torch.ops._C.silu_and_mul.clamp
         elif current_platform.is_cpu():
             self._forward_method = self.forward_native
 
@@ -156,8 +157,10 @@ class SiluAndMul(CustomOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        limit = self.swiglu_limit if self.swiglu_limit is not None else 0.0
-        self.op(out, x, limit)
+        if self.swiglu_limit is not None:
+            self.op_clamp(out, x, self.swiglu_limit)
+        else:
+            self.op(out, x)
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:

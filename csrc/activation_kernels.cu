@@ -253,15 +253,17 @@ packed_gelu_tanh_kernel(const packed_t& val) {
   }
 
 void silu_and_mul(torch::Tensor& out,    // [..., d]
-                  torch::Tensor& input,  // [..., 2 * d]
-                  double limit) {
-  if (limit > 0.0) {
-    LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, vllm::packed_silu_kernel,
-                                  true, true, (float)limit);
-  } else {
-    LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, vllm::packed_silu_kernel,
-                                  true, false, 0.0f);
-  }
+                  torch::Tensor& input)  // [..., 2 * d]
+{
+  LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, vllm::packed_silu_kernel,
+                                true, false, 0.0f);
+}
+
+void silu_and_mul_clamp(torch::Tensor& out,    // [..., d]
+                        torch::Tensor& input,  // [..., 2 * d]
+                        double limit) {
+  LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, vllm::packed_silu_kernel,
+                                true, true, (float)limit);
 }
 
 void mul_and_silu(torch::Tensor& out,    // [..., d]

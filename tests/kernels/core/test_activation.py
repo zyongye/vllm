@@ -112,8 +112,6 @@ def test_act_and_mul(
         opcheck(fn, (out, x, threshold))
     elif activation == "swigluoai_and_mul":
         opcheck(fn, (out, x, layer.alpha, layer.limit))
-    elif activation == "silu_and_mul":
-        opcheck(fn, (out, x, 0.0))
     elif activation != "swiglustep_and_mul":
         opcheck(fn, (out, x))
 
@@ -194,7 +192,7 @@ def test_silu_and_mul_clamp(
 
     # opcheck
     out_buf = torch.empty(x.shape[:-1] + (d,), dtype=dtype, device=device)
-    opcheck(torch.ops._C.silu_and_mul, (out_buf, x, swiglu_limit))
+    opcheck(torch.ops._C.silu_and_mul.clamp, (out_buf, x, swiglu_limit))
 
 
 @pytest.mark.parametrize(
