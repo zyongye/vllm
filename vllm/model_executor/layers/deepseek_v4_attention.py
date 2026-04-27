@@ -338,9 +338,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Run fused_wqa_wkv (heaviest) on the current (default) stream and the
         # three lighter input GEMMs on aux streams 0..2 when their owning
         # module exists. Sync via stream.wait_stream() rather than user-managed
-        # events: aux streams wait_stream(current) so they observe inputs
-        # produced upstream on default, then current.wait_stream(aux) joins
-        # the aux outputs back before returning.
+        # events: a single fan-out barrier (all aux wait_stream(current)) at
+        # the start and a single fan-in barrier (current.wait_stream(each aux))
+        # at the end.
         current = torch.cuda.current_stream()
         aux0, aux1, aux2 = (
             self.aux_stream_list[0],
@@ -348,38 +348,37 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.aux_stream_list[2],
         )
 
+        # Fan-out: every aux stream observes default's prior work.
+        aux0.wait_stream(current)
+        aux1.wait_stream(current)
+        aux2.wait_stream(current)
+
         kv_score: torch.Tensor | None = None
         indexer_weights: torch.Tensor | None = None
         indexer_kv_score: torch.Tensor | None = None
-        used_aux: list[torch.cuda.Stream] = []
 
         if self.compressor is not None:
-            aux0.wait_stream(current)
             with torch.cuda.stream(aux0):
                 kv_score = cublas_gemm_bf16_bf16_fp32(
                     hidden_states, self.compressor.fused_wkv_wgate.weight
                 )
-            used_aux.append(aux0)
 
         if self.indexer is not None:
-            aux1.wait_stream(current)
             with torch.cuda.stream(aux1):
                 # ReplicatedLinear returns (output, bias); bias is None.
                 indexer_weights, _ = self.indexer.weights_proj(hidden_states)
-            used_aux.append(aux1)
-
-            aux2.wait_stream(current)
             with torch.cuda.stream(aux2):
                 indexer_kv_score = cublas_gemm_bf16_bf16_fp32(
                     hidden_states, self.indexer.compressor.fused_wkv_wgate.weight
                 )
-            used_aux.append(aux2)
 
         # MergedColumnParallelLinear returns (output, bias); bias is None.
         qr_kv, _ = self.fused_wqa_wkv(hidden_states)
 
-        for aux in used_aux:
-            current.wait_stream(aux)
+        # Fan-in: default observes every aux stream's outputs.
+        current.wait_stream(aux0)
+        current.wait_stream(aux1)
+        current.wait_stream(aux2)
 
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
