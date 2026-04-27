@@ -412,9 +412,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.eps,
         )
 
-        # Overlap wq_b + kv_insert (+ compressor when indexer is present) on
-        # the aux stream with indexer/compressor on default. q flows out via
-        # event1 sync.
+        # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
+        # on the default stream so q stays on its consumer stream (mla_attn
+        # downstream reads q on default). Indexer/compressor go on aux for
+        # overlap with default's GEMM + cache write.
         if self.indexer is not None:
             assert self.aux_stream_list is not None
             aux_stream = self.aux_stream_list[0]
@@ -429,7 +430,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 compressor(kv_score, positions, self.rotary_emb)
                 return q
 
-            _, q = maybe_execute_in_parallel(
+            q, _ = maybe_execute_in_parallel(
+                wq_b_kv_insert_and_compress,
                 lambda: indexer(
                     hidden_states,
                     qr,
@@ -438,13 +440,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     positions,
                     self.indexer_rotary_emb,
                 ),
-                wq_b_kv_insert_and_compress,
                 self.ln_events[0],
                 self.ln_events[1],
                 aux_stream,
             )
         elif self.compressor is not None:
-            # Compressor on default, wq_b + kv_insert on aux.
+            # wq_b + kv_insert on default, compressor on aux.
             assert self.aux_stream_list is not None
             aux_stream = self.aux_stream_list[0]
             compressor = self.compressor
@@ -454,9 +455,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
-            _, q = maybe_execute_in_parallel(
-                lambda: compressor(kv_score, positions, self.rotary_emb),
+            q, _ = maybe_execute_in_parallel(
                 wq_b_kv_insert,
+                lambda: compressor(kv_score, positions, self.rotary_emb),
                 self.ln_events[0],
                 self.ln_events[1],
                 aux_stream,
