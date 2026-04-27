@@ -16,21 +16,21 @@ __device__ __forceinline__ scalar_t compute(const scalar_t& x,
                                             const scalar_t& y,
                                             const float limit) {
   if constexpr (act_first) {
-    scalar_t gate = ACT_FN(x);
+    scalar_t gate = x;
     scalar_t up = y;
     if constexpr (HAS_CLAMP) {
       gate = (scalar_t)fminf((float)gate, limit);
       up = (scalar_t)fmaxf(fminf((float)up, limit), -limit);
     }
-    return gate * up;
+    return ACT_FN(gate) * up;
   } else {
     scalar_t gate = x;
-    scalar_t up = ACT_FN(y);
+    scalar_t up = y;
     if constexpr (HAS_CLAMP) {
       gate = (scalar_t)fmaxf(fminf((float)gate, limit), -limit);
       up = (scalar_t)fminf((float)up, limit);
     }
-    return gate * up;
+    return gate * ACT_FN(up);
   }
 }
 
@@ -40,7 +40,7 @@ __device__ __forceinline__ packed_t packed_compute(const packed_t& x,
                                                    const packed_t& y,
                                                    const float limit) {
   if constexpr (act_first) {
-    packed_t gate = PACKED_ACT_FN(x);
+    packed_t gate = x;
     packed_t up = y;
     if constexpr (HAS_CLAMP) {
       float2 g = cast_to_float2(gate);
@@ -52,10 +52,10 @@ __device__ __forceinline__ packed_t packed_compute(const packed_t& x,
       gate = cast_to_packed<packed_t>(g);
       up = cast_to_packed<packed_t>(u);
     }
-    return packed_mul(gate, up);
+    return packed_mul(PACKED_ACT_FN(gate), up);
   } else {
     packed_t gate = x;
-    packed_t up = PACKED_ACT_FN(y);
+    packed_t up = y;
     if constexpr (HAS_CLAMP) {
       float2 g = cast_to_float2(gate);
       float2 u = cast_to_float2(up);
@@ -66,7 +66,7 @@ __device__ __forceinline__ packed_t packed_compute(const packed_t& x,
       gate = cast_to_packed<packed_t>(g);
       up = cast_to_packed<packed_t>(u);
     }
-    return packed_mul(gate, up);
+    return packed_mul(gate, PACKED_ACT_FN(up));
   }
 }
 

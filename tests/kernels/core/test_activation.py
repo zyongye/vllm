@@ -164,14 +164,17 @@ def test_silu_and_mul_clamp(
     )
 
     # Verify gate clamping semantics with a controlled scalar case.
-    # silu(large_val) >> swiglu_limit, so after clamp(max=limit) * 1.0 == limit.
+    # gate=large_val is clamped to limit first, then silu(limit) * 1.0.
     x_gate = torch.tensor(
         [[swiglu_limit * 20.0, 1.0]], dtype=torch.float32, device=device
     )
     out_gate = SiluAndMul(compile_native=False, swiglu_limit=swiglu_limit)(x_gate)
+    expected_gate = torch.nn.functional.silu(
+        torch.tensor(swiglu_limit, dtype=torch.float32)
+    ).item()
     torch.testing.assert_close(
         out_gate,
-        torch.tensor([[swiglu_limit]], dtype=torch.float32, device=device),
+        torch.tensor([[expected_gate]], dtype=torch.float32, device=device),
         atol=1e-3,
         rtol=1e-3,
     )

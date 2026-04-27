@@ -140,12 +140,12 @@ class SiluAndMul(CustomOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
         d = x.shape[-1] // 2
-        gate = F.silu(x[..., :d])
+        gate = x[..., :d]
         up = x[..., d:]
         if self.swiglu_limit is not None:
             gate = torch.clamp(gate, max=self.swiglu_limit)
             up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-        return gate * up
+        return F.silu(gate) * up
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
