@@ -120,11 +120,6 @@ class SiluAndMul(CustomOp):
 
     The function computes x -> silu(x[:d]) * x[d:] where d = x.shape[-1] // 2.
 
-    When swiglu_limit is set, inputs are clamped before the activation:
-        gate = clamp(x[:d], max=swiglu_limit)
-        up   = clamp(x[d:], min=-swiglu_limit, max=swiglu_limit)
-        out  = silu(gate) * up
-
     Shapes:
         x: (num_tokens, 2 * d) or (batch_size, seq_len, 2 * d)
         return: (num_tokens, d) or (batch_size, seq_len, d)
@@ -132,35 +127,64 @@ class SiluAndMul(CustomOp):
 
     # --8<-- [end:silu_and_mul]
 
-    def __init__(
-        self, *, compile_native: bool = True, swiglu_limit: float | None = None
-    ):
+    def __init__(self, *, compile_native: bool = True):
         super().__init__(compile_native=compile_native)
-        self.swiglu_limit = swiglu_limit
         if current_platform.is_cuda_alike() or current_platform.is_xpu():
             self.op = torch.ops._C.silu_and_mul
-            self.op_clamp = torch.ops._C.silu_and_mul.clamp
+        elif current_platform.is_cpu():
+            self._forward_method = self.forward_native
+
+    @staticmethod
+    def forward_native(x: torch.Tensor) -> torch.Tensor:
+        """PyTorch-native implementation equivalent to forward()."""
+        d = x.shape[-1] // 2
+        return F.silu(x[..., :d]) * x[..., d:]
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        output_shape = x.shape[:-1] + (d,)
+        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        self.op(out, x)
+        return out
+
+    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_cuda(x)
+
+
+@CustomOp.register("silu_and_mul_with_clamp")
+class SiluAndMulWithClamp(CustomOp):
+    """SwiGLU activation with input clamping (used by some MoE shared experts).
+
+    Computes:
+        gate = clamp(x[..., :d], max=swiglu_limit)
+        up   = clamp(x[..., d:], min=-swiglu_limit, max=swiglu_limit)
+        out  = silu(gate) * up
+    where d = x.shape[-1] // 2.
+
+    Shapes:
+        x: (num_tokens, 2 * d) or (batch_size, seq_len, 2 * d)
+        return: (num_tokens, d) or (batch_size, seq_len, d)
+    """
+
+    def __init__(self, swiglu_limit: float, *, compile_native: bool = True):
+        super().__init__(compile_native=compile_native)
+        self.swiglu_limit = float(swiglu_limit)
+        if current_platform.is_cuda_alike() or current_platform.is_xpu():
+            self.op = torch.ops._C.silu_and_mul_with_clamp
         elif current_platform.is_cpu():
             self._forward_method = self.forward_native
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        """PyTorch-native implementation equivalent to forward()."""
         d = x.shape[-1] // 2
-        gate = x[..., :d]
-        up = x[..., d:]
-        if self.swiglu_limit is not None:
-            gate = torch.clamp(gate, max=self.swiglu_limit)
-            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+        gate = torch.clamp(x[..., :d], max=self.swiglu_limit)
+        up = torch.clamp(x[..., d:], min=-self.swiglu_limit, max=self.swiglu_limit)
         return F.silu(gate) * up
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        if self.swiglu_limit is not None:
-            self.op_clamp(out, x, self.swiglu_limit)
-        else:
-            self.op(out, x)
+        self.op(out, x, self.swiglu_limit)
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:

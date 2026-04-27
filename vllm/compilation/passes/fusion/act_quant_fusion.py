@@ -29,7 +29,6 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
 SILU_MUL_OP = torch.ops._C.silu_and_mul.default
-SILU_MUL_CLAMP_OP = torch.ops._C.silu_and_mul.clamp
 
 FUSED_OPS: dict[QuantKey, OpOverload] = {
     kFp8StaticTensorSym: torch.ops._C.silu_and_mul_quant.default,  # noqa: E501
@@ -316,20 +315,3 @@ class ActivationQuantFusionPass(VllmFusionPatternMatcherPass):
                 )
 
         self.dump_patterns(config, self.pm_pass)
-
-    def __call__(self, graph: torch.fx.Graph) -> None:
-        for node in graph.nodes:
-            if (
-                node.op == "call_function"
-                and node.target is auto_functionalized
-                and node.args
-                and node.args[0] is SILU_MUL_CLAMP_OP
-            ):
-                raise NotImplementedError(
-                    "ActivationQuantFusionPass does not yet support "
-                    "SiluAndMul with swiglu_limit (clamp). The fused "
-                    "silu_and_mul+quant kernels do not bake in the clamp; "
-                    "either disable pass_config.fuse_act_quant or unset "
-                    "swiglu_limit on the SiluAndMul layer."
-                )
-        super().__call__(graph)

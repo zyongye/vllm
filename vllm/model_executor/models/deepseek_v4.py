@@ -17,7 +17,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.deepseek_v4_attention import (
     DeepseekV4Indexer,
     DeepseekV4MLAModules,
@@ -105,7 +105,10 @@ class DeepseekV4MLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul(swiglu_limit=swiglu_limit)
+        if swiglu_limit is not None:
+            self.act_fn = SiluAndMulWithClamp(swiglu_limit)
+        else:
+            self.act_fn = SiluAndMul()
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
