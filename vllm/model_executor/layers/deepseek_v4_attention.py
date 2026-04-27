@@ -4,8 +4,9 @@
 DeepseekV4 MLA Attention Layer
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
@@ -16,6 +17,7 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
+from vllm.model_executor.layers.utils import cublas_gemm_bf16_bf16_fp32
 from vllm.utils.deep_gemm import fp8_einsum
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.deepseek_v4_ops import (
@@ -51,7 +53,10 @@ from vllm.model_executor.layers.quantization.input_quant_fp8 import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
 )
-from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+from vllm.utils.multi_stream_utils import (
+    execute_in_parallel,
+    maybe_execute_in_parallel,
+)
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     DeepseekV4FlashMLASparseBackend,
@@ -94,7 +99,7 @@ class DeepseekV4MLAModules:
     indexer: torch.nn.Module | None
     indexer_rotary_emb: torch.nn.Module
     topk_indices_buffer: torch.Tensor | None
-    aux_stream: torch.cuda.Stream | None = None
+    aux_stream_list: list[torch.cuda.Stream] | None = None
 
 
 # --8<-- [start:multi_head_latent_attention]
@@ -217,8 +222,14 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             + 1  # 1B pad
         )
 
-        self.aux_stream = mla_modules.aux_stream
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.aux_stream_list = mla_modules.aux_stream_list
+        # ln_events[0]: doubles as the GEMM-phase start event (default stream
+        # → fan-out to all aux streams) and as event0 for the subsequent
+        # maybe_execute_in_parallel call. ln_events[1..3] are the three
+        # GEMM-phase done events; ln_events[1] is also reused as event1 for
+        # maybe_execute_in_parallel since the GEMM phase has fully joined
+        # before that call.
+        self.ln_events = [torch.cuda.Event() for _ in range(4)]
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         self.swa_cache_layer = DeepseekV4SWACache(
@@ -277,9 +288,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
-        qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
-
         # Pre-allocate attention output with FlashMLA-padded head count.
         # The op writes into `o_padded`; we slice to n_local_heads after.
         num_tokens = hidden_states.shape[0]
@@ -292,8 +300,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Attention (inside custom op for torch.compile boundary)
         torch.ops.vllm.deepseek_v4_attention(
             hidden_states,
-            qr,
-            kv,
             positions,
             o_padded,
             self.layer_name,
@@ -332,17 +338,71 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         return self.wo_b(z.flatten(1))
 
+    def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
+        assert self.aux_stream_list is not None
+        assert len(self.aux_stream_list) >= 3
+
+        # fused_wqa_wkv (heaviest) on default; the three lighter input GEMMs
+        # on aux streams 0..2 when their owning module exists. ln_events[0]
+        # is the fan-out start event; ln_events[1..3] are per-aux done events.
+        aux_fns: list[Callable[[], Any] | None] = [None, None, None]
+
+        if self.compressor is not None:
+            # Local ref so the closure keeps a non-None type for mypy.
+            compressor = self.compressor
+
+            def compressor_kv_score() -> torch.Tensor:
+                return cublas_gemm_bf16_bf16_fp32(
+                    hidden_states, compressor.fused_wkv_wgate.weight
+                )
+
+            aux_fns[0] = compressor_kv_score
+
+        if self.indexer is not None:
+            indexer = self.indexer
+
+            def indexer_weights_proj() -> torch.Tensor:
+                # ReplicatedLinear returns (output, bias); bias is None.
+                weights, _ = indexer.weights_proj(hidden_states)
+                return weights
+
+            def indexer_compressor_kv_score() -> torch.Tensor:
+                return cublas_gemm_bf16_bf16_fp32(
+                    hidden_states, indexer.compressor.fused_wkv_wgate.weight
+                )
+
+            aux_fns[1] = indexer_weights_proj
+            aux_fns[2] = indexer_compressor_kv_score
+
+        def fused_wqa_wkv() -> torch.Tensor:
+            # MergedColumnParallelLinear returns (output, bias); bias is None.
+            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+            return qr_kv
+
+        qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
+            fused_wqa_wkv,
+            aux_fns,
+            self.ln_events[0],
+            self.ln_events[1:4],
+            self.aux_stream_list[:3],
+        )
+
+        return qr_kv, kv_score, indexer_kv_score, indexer_weights
+
     def attention_impl(
         self,
         hidden_states: torch.Tensor,
-        qr: torch.Tensor,
-        kv: torch.Tensor,
         positions: torch.Tensor,
         out: torch.Tensor,  # [num_tokens, padded_heads, head_dim], written in place
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
+        qr_kv, kv_score, indexer_kv_score, indexer_weights = (
+            self.attn_gemm_parallel_execute(hidden_states)
+        )
+
+        qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
         qr, kv = fused_q_kv_rmsnorm(
             qr,
             kv,
@@ -356,6 +416,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Indexer implies compressor; when both exist, compressor rides on the
         # aux stream alongside kv_insert so the heavy indexer owns default.
         if self.indexer is not None:
+            assert self.aux_stream_list is not None
+            aux_stream = self.aux_stream_list[0]
             indexer = self.indexer
             # Local ref so the closure keeps a non-None type for mypy.
             assert self.compressor is not None
@@ -363,26 +425,35 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
             def kv_insert_and_compress() -> None:
                 self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
-                compressor(hidden_states, positions, self.rotary_emb)
+                compressor(kv_score, positions, self.rotary_emb)
 
             maybe_execute_in_parallel(
-                lambda: indexer(hidden_states, qr, positions, self.indexer_rotary_emb),
+                lambda: indexer(
+                    hidden_states,
+                    q,
+                    indexer_kv_score,
+                    indexer_weights,
+                    positions,
+                    self.indexer_rotary_emb,
+                ),
                 kv_insert_and_compress,
                 self.ln_events[0],
                 self.ln_events[1],
-                self.aux_stream,
+                aux_stream,
             )
         elif self.compressor is not None:
             # Compressor on default, kv_insert on aux.
+            assert self.aux_stream_list is not None
+            aux_stream = self.aux_stream_list[0]
             compressor = self.compressor
             maybe_execute_in_parallel(
-                lambda: compressor(hidden_states, positions, self.rotary_emb),
+                lambda: compressor(kv_score, positions, self.rotary_emb),
                 lambda: self._fused_qnorm_rope_kv_insert(
                     q, kv, positions, attn_metadata
                 ),
                 self.ln_events[0],
                 self.ln_events[1],
-                self.aux_stream,
+                aux_stream,
             )
         else:
             # SWA-only layer: no compressor, no overlap.
@@ -455,21 +526,17 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
 def deepseek_v4_attention(
     hidden_states: torch.Tensor,
-    qr: torch.Tensor,
-    kv: torch.Tensor,
     positions: torch.Tensor,
     out: torch.Tensor,
     layer_name: str,
 ) -> None:
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
-    self.attention_impl(hidden_states, qr, kv, positions, out)
+    self.attention_impl(hidden_states, positions, out)
 
 
 def deepseek_v4_attention_fake(
     hidden_states: torch.Tensor,
-    qr: torch.Tensor,
-    kv: torch.Tensor,
     positions: torch.Tensor,
     out: torch.Tensor,
     layer_name: str,
@@ -1056,19 +1123,19 @@ class DeepseekV4Indexer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        qr: torch.Tensor,
+        q: torch.Tensor,
+        compressed_kv_score: torch.Tensor,
+        indexer_weights: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
     ) -> torch.Tensor:
-        q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
-        k = self.compressor(hidden_states, positions, rotary_emb)
-        weights, _ = self.weights_proj(hidden_states)
+        k = self.compressor(compressed_kv_score, positions, rotary_emb)
         q_quant, weights = fused_indexer_q_rope_quant(
             positions,
             q,
             rotary_emb.cos_sin_cache,
-            weights,
+            indexer_weights,
             self.softmax_scale,
             self.n_head**-0.5,
             use_fp4=self.use_fp4_kv,
