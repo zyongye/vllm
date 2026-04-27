@@ -405,4 +405,5 @@ class MatcherSiluAndMul(MatcherCustomOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        return SiluAndMul(compile_native=False).forward_native(x)
+        d = x.shape[-1] // 2
+        return torch.nn.functional.silu(x[..., :d]) * x[..., d:]
