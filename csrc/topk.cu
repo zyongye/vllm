@@ -154,24 +154,30 @@ void launch_persistent_topk(const torch::Tensor& logits,
                 "workspace too small, need ", state_bytes, " bytes");
 
     // Zero the per-group RadixRowState region before launch — only when the
-    // radix path will actually run (max_seq_len > RADIX_THRESHOLD). The
-    // RadixRowState fields (arrival_counter, histograms) are only touched by
-    // radix_topk; the decode/medium paths inside the persistent kernel
-    // operate purely in shared memory and never read these globals, so a
-    // stale workspace is harmless for them.
+    // radix path will actually run (max_seq_len > RADIX_THRESHOLD), and only
+    // the fields that are read uninitialized: arrival_counter (4B) and
+    // histogram[0] (RADIX * 4 = 1024B). RadixRowState is laid out so these
+    // two fields are contiguous at offset 0..1028, allowing a single
+    // cudaMemset2DAsync(pitch=sizeof(RadixRowState), width=1028,
+    // height=num_groups) to skip the self-managed bytes per group:
+    // histogram[1]/[2] are zeroed by the kernel's next_hist rotation, and
+    // output_counter is reset via st_release at the top of radix_topk.
     //
-    // Why we need the memset (when needs_cooperative is true):
+    // Why pre-zeroing is required (when needs_cooperative is true):
     //   1. arrival_counter accumulates within a launch and is never reset,
     //      so a prior call leaves it at a large positive value. Without this
     //      reset, the very first wait_ge in the next call sees counter >>
     //      target and returns instantly, breaking the barrier.
-    //   2. The previous in-kernel init only ran in CTA-0 with intra-CTA
-    //      __syncthreads(), so it had no happens-before edge to CTA-1+'s
-    //      first red_release. cudaMemsetAsync is stream-ordered: the zero
-    //      is globally visible before any CTA runs.
+    //   2. Inside the kernel, only CTA-0 used to initialize it with intra-CTA
+    //      __syncthreads(), giving no happens-before edge to CTA-1+'s first
+    //      red_release. cudaMemset2DAsync is stream-ordered: the zero is
+    //      globally visible before any CTA runs.
     if (needs_cooperative) {
-      cudaError_t mz_err = cudaMemsetAsync(workspace.data_ptr<uint8_t>(), 0,
-                                           state_bytes, stream);
+      constexpr size_t kRadixPreInitBytes =
+          sizeof(int) + P::RADIX * sizeof(uint32_t);  // 1028
+      cudaError_t mz_err = cudaMemset2DAsync(
+          workspace.data_ptr<uint8_t>(), sizeof(P::RadixRowState), 0,
+          kRadixPreInitBytes, num_groups, stream);
       TORCH_CHECK(mz_err == cudaSuccess,
                   "row_states memset failed: ", cudaGetErrorString(mz_err));
     }

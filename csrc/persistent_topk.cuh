@@ -113,12 +113,21 @@ __device__ __forceinline__ void load_float4_predicated(const float* ptr,
 // Large path: inter-CTA coordination state (one per group)
 // ============================================================================
 
+// Layout matters: the host pre-zeroes only the first
+//   sizeof(int) + RADIX * sizeof(uint32_t) = 1028 bytes
+// of every group's state via cudaMemset2DAsync (see topk.cu). That covers
+// `arrival_counter` (read first by red_release/wait_ge before any kernel
+// init) and `histogram[0]` (read in round 0 of the first row). The other
+// histograms are zeroed by the in-kernel `next_hist` rotation; the
+// remaining fields are reset by the kernel itself before being read.
 struct RadixRowState {
-  uint32_t histogram[3][256];  // Triple-buffered histograms
-  uint32_t remaining_k;
-  uint32_t prefix;
-  int arrival_counter;
-  int output_counter;
+  // === Pre-zeroed region (must stay contiguous at offset 0..1028) ===
+  int arrival_counter;  // spin-wait barrier counter, monotonic per launch
+  uint32_t histogram[3][256];  // triple-buffered histograms
+  // === Self-managed fields (kernel resets/initializes before use) ===
+  uint32_t remaining_k;  // unused (legacy)
+  uint32_t prefix;       // unused (legacy)
+  int output_counter;    // reset via st_release in radix_topk
 };
 
 // ============================================================================
