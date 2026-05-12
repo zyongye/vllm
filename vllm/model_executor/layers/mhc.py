@@ -5,7 +5,6 @@ import torch
 # this import will also register the custom ops
 import vllm.model_executor.kernels.mhc as mhc_kernels
 from vllm.model_executor.custom_op import CustomOp
-from vllm.platforms import current_platform
 
 
 @CustomOp.register("mhc_pre")
@@ -133,7 +132,6 @@ class HCHeadOp(CustomOp):
     def enabled(cls) -> bool:
         return True
 
-    @torch.compile(backend=current_platform.simple_compile_backend)
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,
@@ -164,7 +162,6 @@ class HCHeadOp(CustomOp):
         )
         return out.view(*outer_shape, hidden_size)
 
-    @torch.compile(backend=current_platform.simple_compile_backend)
     def forward_hip(
         self,
         hidden_states: torch.Tensor,
