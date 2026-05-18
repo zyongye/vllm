@@ -281,6 +281,64 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 k_cache_prefix=self.mla_attn.prefix,
             )
 
+        # Split fused_wqa_wkv into quant + scaled_mm so the 4-way fan-out
+        # overlaps as pure GEMMs; None when the kernel can't be bypassed.
+        from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel import (  # noqa: E501
+            Fp8BlockScaledMMLinearKernel,
+        )
+
+        qm = getattr(self.fused_wqa_wkv, "quant_method", None)
+        kernel = getattr(qm, "fp8_linear", None)
+        if (
+            isinstance(kernel, Fp8BlockScaledMMLinearKernel)
+            and kernel.apply_input_quant
+        ):
+            fused_wqa_wkv_layer = self.fused_wqa_wkv
+
+            def _fused_wqa_wkv_quant(
+                x: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                input_2d = x.view(-1, x.shape[-1])
+                return kernel.quant_fp8(
+                    input_2d, None, None, use_triton=kernel.use_triton
+                )
+
+            def _fused_wqa_wkv_scaled_mm(
+                q_input: torch.Tensor,
+                input_scale: torch.Tensor,
+                x_shape: torch.Size,
+                x_dtype: torch.dtype,
+            ) -> torch.Tensor:
+                weight = fused_wqa_wkv_layer.weight
+                weight_scale_inv = getattr(
+                    fused_wqa_wkv_layer, "weight_scale_inv", None
+                )
+                weight_scale = (
+                    fused_wqa_wkv_layer.weight_scale
+                    if weight_scale_inv is None
+                    else weight_scale_inv
+                )
+                output = kernel.apply_block_scaled_mm(
+                    A=q_input,
+                    B=weight,
+                    As=input_scale,
+                    Bs=weight_scale,
+                )
+                return output.to(dtype=x_dtype).view(*x_shape[:-1], weight.shape[0])
+
+            self._fused_wqa_wkv_quant: (
+                Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]] | None
+            ) = _fused_wqa_wkv_quant
+            self._fused_wqa_wkv_scaled_mm: (
+                Callable[
+                    [torch.Tensor, torch.Tensor, torch.Size, torch.dtype], torch.Tensor
+                ]
+                | None
+            ) = _fused_wqa_wkv_scaled_mm
+        else:
+            self._fused_wqa_wkv_quant = None
+            self._fused_wqa_wkv_scaled_mm = None
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -393,10 +451,22 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             aux_fns[1] = indexer_weights_proj
             aux_fns[2] = indexer_compressor_kv_score
 
-        def fused_wqa_wkv() -> torch.Tensor:
-            # MergedColumnParallelLinear returns (output, bias); bias is None.
-            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
-            return qr_kv
+        # Pre-quantize before fan-out so fused_wqa_wkv is a pure GEMM.
+        quant_fn = self._fused_wqa_wkv_quant
+        scaled_mm_fn = self._fused_wqa_wkv_scaled_mm
+        if quant_fn is not None and scaled_mm_fn is not None:
+            q_input, input_scale = quant_fn(hidden_states)
+            x_shape = hidden_states.shape
+            x_dtype = hidden_states.dtype
+
+            def fused_wqa_wkv() -> torch.Tensor:
+                return scaled_mm_fn(q_input, input_scale, x_shape, x_dtype)
+        else:
+
+            def fused_wqa_wkv() -> torch.Tensor:
+                # MergedColumnParallelLinear returns (output, bias); bias is None.
+                qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+                return qr_kv
 
         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
             fused_wqa_wkv,
