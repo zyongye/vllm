@@ -71,13 +71,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
-        # FP8 decode kernel only supports h_q = 64 or 128.
-        if num_heads > 128:
-            raise ValueError(
-                f"DeepseekV4 Flashinfer MLA Sparse does not support {num_heads} heads "
-                "(FP8 decode kernel requires h_q in {64, 128})."
-            )
-        return 64 if num_heads <= 64 else 128
+        return num_heads
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return deep_gemm_fp8_o_proj(
