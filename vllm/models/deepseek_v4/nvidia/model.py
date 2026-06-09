@@ -153,7 +153,9 @@ def make_deepseek_v4_expert_params_mapping(
 
 
 class DeepseekV4MegaMoEExperts(nn.Module):
-    _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int, str], object] = {}
+    _symm_buffer_cache: dict[
+        tuple[int, int, int, int, int, int, int, str, torch.dtype], object
+    ] = {}
 
     def __init__(
         self,
@@ -168,6 +170,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         prefix: str = "",
         num_logical_experts: int | None = None,
         act_format: str = "fp8",
+        combine_dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
         self.prefix = prefix
@@ -180,6 +183,8 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.intermediate_size = intermediate_size
         # Dispatch activation format for the symmetric buffer: 'fp8' or 'mxfp4'.
         self.act_format = act_format
+        # Combine all-to-all dtype: bf16 or float8_e4m3fn (FP8 combine).
+        self.combine_dtype = combine_dtype
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
         self.num_logical_experts = (
@@ -367,6 +372,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             self.hidden_size,
             self.intermediate_size,
             self.act_format,
+            self.combine_dtype,
         )
         symm_buffer = self._symm_buffer_cache.get(key)
         if symm_buffer is None:
@@ -378,6 +384,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 self.hidden_size,
                 self.intermediate_size,
                 act_format=self.act_format,
+                combine_dtype=self.combine_dtype,
             )
             self._symm_buffer_cache[key] = symm_buffer
         return symm_buffer
@@ -529,6 +536,10 @@ class DeepseekV4MoE(nn.Module):
         self.mega_act_format = (
             "mxfp4" if moe_backend == "deep_gemm_amxf4_mega_moe" else "fp8"
         )
+        # FP8 combine is an independent opt-in; composes with either act format.
+        self.mega_combine_dtype = (
+            torch.float8_e4m3fn if envs.VLLM_DSV4_MEGA_FP8_COMBINE else torch.bfloat16
+        )
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently requires expert parallel. "
@@ -648,6 +659,7 @@ class DeepseekV4MoE(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             prefix=f"{prefix}.experts",
             act_format=self.mega_act_format,
+            combine_dtype=self.mega_combine_dtype,
         )
 
     def _init_fused_moe_experts(
