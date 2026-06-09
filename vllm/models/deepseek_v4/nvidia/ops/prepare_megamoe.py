@@ -2,20 +2,31 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton input-staging kernel for DeepSeek V4 MegaMoE.
 
-Quantizes hidden states to fp8 with E8M0 group scales and repacks the
+Quantizes hidden states with UE8M0 block-32 group scales and repacks the
 routing top-k tensors into the int64/float32 layout that the DeepGEMM
 MegaMoE kernels consume.
+
+The activation format is inferred from the output ``x`` buffer dtype, matching
+the symmetric-buffer contract in DeepGEMM's ``docs/mega_moe_mxfp4.md``:
+
+- float8 buffer (``[num_tokens, hidden]``): per-group fp8 e4m3 (scale / 448).
+- int8 buffer (``[num_tokens, hidden / 2]``): MXFP4, two E2M1 values per byte
+  (low nibble = even col, high nibble = odd col, scale / 6).
+
+The ``x_sf`` scale tensor is identical for both: int32, ``[num_tokens,
+hidden / 128]``, four UE8M0 block-32 exponents packed per int32 (K-major).
 """
 
 import torch
 
+from vllm.models.deepseek_v4.common.ops.fused_indexer_q import _fp32x2_to_fp4x2
 from vllm.triton_utils import tl, triton
 
 
 @triton.jit
 def _prepare_megamoe_inputs_kernel(
     hidden_states,
-    x_fp8,
+    x_q,
     x_sf,
     topk_ids,
     topk_weights,
@@ -42,6 +53,7 @@ def _prepare_megamoe_inputs_kernel(
     BLOCK_K: tl.constexpr,
     GROUP_K: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
+    USE_FP4: tl.constexpr,
 ) -> None:
     token_id = tl.program_id(0)
     k_block_id = tl.program_id(1)
@@ -59,7 +71,9 @@ def _prepare_megamoe_inputs_kernel(
     amax = tl.max(hidden_groups, axis=1)
     amax = tl.maximum(amax, 1.0e-4)
 
-    scale = amax / 448.0
+    # MXFP4 E2M1 saturates at 6.0; fp8 e4m3 at 448.0.
+    SCALE_DIVISOR: tl.constexpr = 6.0 if USE_FP4 else 448.0
+    scale = amax / SCALE_DIVISOR
     scale_bits = scale.to(tl.uint32, bitcast=True)
     scale_exp = ((scale_bits >> 23) & 0xFF) + ((scale_bits & 0x7FFFFF) != 0).to(
         tl.uint32
@@ -70,12 +84,22 @@ def _prepare_megamoe_inputs_kernel(
     hidden_groups = tl.reshape(hidden, [num_groups, GROUP_K])
     scaled = hidden_groups * (1.0 / rounded_scale)[:, None]
     scaled = tl.reshape(scaled, [BLOCK_K])
-    fp8 = scaled.to(tl.float8e4nv)
-    tl.store(
-        x_fp8 + token_id * x_stride_m + k_offsets * x_stride_k,
-        fp8,
-        mask=k_mask,
-    )
+    if USE_FP4:
+        # Pack two E2M1 per byte: low nibble = even col, high nibble = odd col.
+        x_lo, x_hi = tl.split(tl.reshape(scaled, [BLOCK_K // 2, 2]))
+        packed = _fp32x2_to_fp4x2(x_lo, x_hi)
+        half_offsets = k_block_id * (BLOCK_K // 2) + tl.arange(0, BLOCK_K // 2)
+        tl.store(
+            x_q + token_id * x_stride_m + half_offsets * x_stride_k,
+            packed.to(tl.int8, bitcast=True),
+        )
+    else:
+        fp8 = scaled.to(tl.float8e4nv)
+        tl.store(
+            x_q + token_id * x_stride_m + k_offsets * x_stride_k,
+            fp8,
+            mask=k_mask,
+        )
 
     scale_offsets = tl.arange(0, num_groups)
     packed_scale = tl.sum(scale_exp << (scale_offsets * 8), axis=0).to(tl.int32)
@@ -126,7 +150,7 @@ def prepare_megamoe_inputs(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    x_fp8: torch.Tensor,
+    x_q: torch.Tensor,
     x_sf: torch.Tensor,
     topk_idx_out: torch.Tensor,
     topk_weights_out: torch.Tensor,
@@ -147,13 +171,25 @@ def prepare_megamoe_inputs(
             "topk_ids to have the same shape."
         )
 
+    # The activation format is inferred from the output buffer dtype: an int8
+    # buffer carries packed MXFP4 (hidden / 2 wide), anything else is fp8.
+    use_fp4 = x_q.dtype == torch.int8
+    expected_width = hidden_size // 2 if use_fp4 else hidden_size
+    if x_q.shape != (num_tokens, expected_width):
+        raise ValueError(
+            "DeepSeek V4 MegaMoE input staging expected x buffer of shape "
+            f"{(num_tokens, expected_width)} for "
+            f"{'mxfp4' if use_fp4 else 'fp8'} activations, got "
+            f"{tuple(x_q.shape)}."
+        )
+
     block_k = 128
     grid = (num_tokens, triton.cdiv(hidden_size, block_k))
     block_topk = triton.next_power_of_2(top_k)
     padding_stride_m = is_padding.stride(0) if is_padding is not None else 0
     _prepare_megamoe_inputs_kernel[grid](
         hidden_states,
-        x_fp8,
+        x_q,
         x_sf,
         topk_ids,
         topk_weights,
@@ -162,8 +198,8 @@ def prepare_megamoe_inputs(
         topk_weights_out,
         hidden_states.stride(0),
         hidden_states.stride(1),
-        x_fp8.stride(0),
-        x_fp8.stride(1),
+        x_q.stride(0),
+        x_q.stride(1),
         x_sf.stride(0),
         x_sf.stride(1),
         topk_ids.stride(0),
@@ -180,5 +216,6 @@ def prepare_megamoe_inputs(
         BLOCK_K=block_k,
         GROUP_K=32,
         BLOCK_TOPK=block_topk,
+        USE_FP4=use_fp4,
         num_warps=4,
     )

@@ -28,8 +28,8 @@ if(DEEPGEMM_SRC_DIR)
   message(STATUS "DeepGEMM using local DEEPGEMM_SRC_DIR: ${deepgemm_SOURCE_DIR}")
 else()
   # Keep in sync with tools/install_deepgemm.sh
-  set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/deepseek-ai/DeepGEMM.git")
-  set(_DEEPGEMM_UPSTREAM_TAG "891d57b4db1071624b5c8fa0d1e51cb317fa709f")
+  set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/zyongye/DeepGEMM.git")
+  set(_DEEPGEMM_UPSTREAM_TAG "83ffc0cd5d11b8b9cfed678b13475bc87ab94ae8")
 
   set(_deepgemm_fc_root "${FETCHCONTENT_BASE_DIR}")
   if(NOT _deepgemm_fc_root)
