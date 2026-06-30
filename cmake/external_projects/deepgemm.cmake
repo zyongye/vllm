@@ -29,7 +29,7 @@ if(DEEPGEMM_SRC_DIR)
 else()
   # Keep in sync with tools/install_deepgemm.sh
   set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/zyongye/DeepGEMM.git")
-  set(_DEEPGEMM_UPSTREAM_TAG "83ffc0cd5d11b8b9cfed678b13475bc87ab94ae8")
+  set(_DEEPGEMM_UPSTREAM_TAG "e1e5123e469eaeaf0aa4115ea97106b35935802a")
 
   set(_deepgemm_fc_root "${FETCHCONTENT_BASE_DIR}")
   if(NOT _deepgemm_fc_root)
