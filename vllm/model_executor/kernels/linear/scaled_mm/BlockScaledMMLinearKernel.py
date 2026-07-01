@@ -8,10 +8,15 @@ from typing import ClassVar
 import torch
 from typing_extensions import Self
 
+from vllm.model_executor.layers.fusion.quant_activation import (
+    QuantizedActivation,
+    as_quantized_activation,
+)
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     process_fp8_weight_block_strategy,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.model_executor.utils import replace_parameter
 
 from ..base import (
@@ -58,6 +63,18 @@ class Fp8BlockScaledMMLinearKernel(
         )
         self.use_triton = False
 
+    def input_quant_key(self) -> QuantKey | None:
+        # An upstream producer may substitute a pre-quantized activation only
+        # when this kernel would otherwise quantize its own input via
+        # self.quant_fp8. Variants that take BF16 directly
+        # (apply_input_quant=False) must keep quantizing inside the GEMM, so
+        # they advertise no key. The scale layout (column-major / ue8m0 /
+        # TMA-aligned) is not captured by the key; producers must reuse this
+        # kernel's quant_fp8 to match it (see quantize_activation).
+        if not self.apply_input_quant:
+            return None
+        return self.config.activation_quant_key
+
     @classmethod
     def can_implement(cls, config: FP8ScaledMMLinearLayerConfig):
         act_quant_key = config.activation_quant_key
@@ -97,7 +114,7 @@ class Fp8BlockScaledMMLinearKernel(
     def apply_weights(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | QuantizedActivation,
         bias: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -112,22 +129,30 @@ class Fp8BlockScaledMMLinearKernel(
         input_scale = params.input_scale
         scale_up = params.input_scale_ub
 
-        # View input as 2D matrix for fp8 methods
-        input_2d = x.view(-1, x.shape[-1])
-        output_shape = [*x.shape[:-1], weight.shape[0]]
-
-        if self.apply_input_quant:
-            q_input, input_scale = self.quant_fp8(
-                input_2d, input_scale, scale_up, use_triton=self.use_triton
-            )
+        qa = as_quantized_activation(x, self.input_quant_key())
+        if qa is not None:
+            # Pre-quantized upstream (matching quant_fp8's layout); skip our own
+            # quant. input_quant_key() is non-None only when apply_input_quant.
+            q_input, input_scale = qa.data, qa.scale
+            output_shape = [*qa.orig_shape[:-1], weight.shape[0]]
         else:
-            q_input = input_2d
-            # Provide a concrete placeholder so apply_block_scaled_mm args are
-            # always Tensors. Subclasses with apply_input_quant=False must not
-            # use As in apply_block_scaled_mm.
-            input_scale = (
-                input_scale if input_scale is not None else input_2d.new_empty(1)
-            )
+            assert isinstance(x, torch.Tensor)
+            # View input as 2D matrix for fp8 methods
+            input_2d = x.view(-1, x.shape[-1])
+            output_shape = [*x.shape[:-1], weight.shape[0]]
+
+            if self.apply_input_quant:
+                q_input, input_scale = self.quant_fp8(
+                    input_2d, input_scale, scale_up, use_triton=self.use_triton
+                )
+            else:
+                q_input = input_2d
+                # Provide a concrete placeholder so apply_block_scaled_mm args
+                # are always Tensors. Subclasses with apply_input_quant=False
+                # must not use As in apply_block_scaled_mm.
+                input_scale = (
+                    input_scale if input_scale is not None else input_2d.new_empty(1)
+                )
 
         output = self.apply_block_scaled_mm(
             A=q_input,

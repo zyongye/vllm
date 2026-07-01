@@ -41,6 +41,7 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
@@ -59,6 +60,17 @@ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
+
+
+def _maybe_prequant(
+    layer: nn.Module, x: torch.Tensor
+) -> torch.Tensor | QuantizedActivation:
+    """Pre-quantize ``x`` via ``layer``'s fp8 kernel so the linear can skip its
+    own input quant. Returns ``x`` unchanged when the layer is not fp8 or its
+    kernel quantizes internally, so call sites can wire this unconditionally.
+    """
+    quantize = getattr(layer.quant_method, "quantize_activation", None)
+    return quantize(layer, x) if quantize is not None else x
 
 
 def _resolve_dsv4_kv_cache_dtype(
@@ -371,6 +383,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             assert len(aux_streams) >= 3
             aux_streams = aux_streams[:3]
 
+        # Pre-quantize the fused_wqa_wkv fp8 activation on the default stream,
+        # outside the multi-stream fan-out below, so the quant kernel does not
+        # sit inside execute_in_parallel. bf16 hidden_states is kept for the
+        # compressor / indexer raw-mm aux consumers.
+        wqa_wkv_input = _maybe_prequant(self.fused_wqa_wkv, hidden_states)
+
         # fused_wqa_wkv (heaviest) on default; the three lighter input GEMMs
         # on aux streams 0..2 when their owning module exists. ln_events[0]
         # is the fan-out start event; ln_events[1..3] are per-aux done events.
@@ -410,7 +428,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         def fused_wqa_wkv() -> torch.Tensor:
             # MergedColumnParallelLinear returns (output, bias); bias is None.
-            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+            # Activation is pre-quantized above, outside the multi-stream region.
+            qr_kv, _ = self.fused_wqa_wkv(wqa_wkv_input)
             return qr_kv
 
         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
@@ -439,6 +458,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
+
+        # Pre-quantize qr once and share the fp8 activation across the main-attn
+        # wq_b and the indexer wq_b (both DeepGEMM block-fp8), deleting the
+        # duplicate activation quant. Both kernels use the same quant_fp8 layout;
+        # as_quantized_activation validates the key match at each consumer. No-op
+        # (returns bf16 qr) when wq_b is not fp8.
+        qr = _maybe_prequant(self.wq_b, qr)
 
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (forward_mqa
@@ -765,7 +791,7 @@ class DeepseekV4Indexer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        qr: torch.Tensor,
+        qr: torch.Tensor | QuantizedActivation,
         compressed_kv_score: torch.Tensor,
         indexer_weights: torch.Tensor,
         positions: torch.Tensor,
@@ -775,6 +801,8 @@ class DeepseekV4Indexer(nn.Module):
 
         def wq_b_and_q_quant():
             # ReplicatedLinear returns (output, bias); bias is None.
+            # qr may be a pre-quantized activation shared with the main-attn
+            # wq_b; the linear kernel consumes it directly.
             q, _ = self.wq_b(qr)
             q = q.view(-1, self.n_head, self.head_dim)
             return fused_indexer_q_rope_quant(

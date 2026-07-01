@@ -19,8 +19,18 @@ from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
     FlashInferCutlassNvFp4LinearKernel,
     FlashInferTrtllmNvFp4LinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.aiter import (
+    AiterFp8BlockScaledMMKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel import (
+    Fp8BlockScaledMMLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
+    CutlassFp8BlockScaledMMKernel,
     CutlassFP8ScaledMMLinearKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.deep_gemm import (
+    DeepGemmFp8BlockScaledMMKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
     FlashInferFP8ScaledMMLinearKernel,
@@ -30,22 +40,39 @@ from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
     Int8ScaledMMLinearKernel,
     Int8ScaledMMLinearLayerConfig,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.triton import (
+    TritonFp8BlockScaledMMKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.xpu import (
+    XPUFp8BlockScaledMMKernel,
+)
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     as_quantized_activation,
     expose_input_quant_key,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8Dynamic128Sym,
+    kFp8Static128BlockSym,
     kFp8StaticTensorSym,
     kNvfp4Dynamic,
 )
 from vllm.platforms import current_platform
 
-# The only backends that consume a pre-quantized activation.
+# The only backends that consume a pre-quantized activation: per-tensor fp8 and
+# nvfp4, plus the block-fp8 kernels that quantize their own input via quant_fp8
+# (apply_input_quant=True) and so can accept a substitute produced by that same
+# quant_fp8. The BF16-input variants (FlashInfer block, dynamic-dispatch, CPU)
+# keep apply_input_quant=False and declare no key.
 SUPPORTING = {
     CutlassFP8ScaledMMLinearKernel,
     FlashInferFP8ScaledMMLinearKernel,
     FlashInferCutlassNvFp4LinearKernel,
+    DeepGemmFp8BlockScaledMMKernel,
+    CutlassFp8BlockScaledMMKernel,
+    TritonFp8BlockScaledMMKernel,
+    AiterFp8BlockScaledMMKernel,
+    XPUFp8BlockScaledMMKernel,
 }
 
 
@@ -72,6 +99,14 @@ def _probe(cls: type):
     elif issubclass(cls, Int8ScaledMMLinearKernel):
         obj.config = Int8ScaledMMLinearLayerConfig(
             is_static_input_scheme=True, is_channelwise=False, input_symmetric=True
+        )
+    elif issubclass(cls, Fp8BlockScaledMMLinearKernel):
+        obj.config = FP8ScaledMMLinearLayerConfig(
+            weight_quant_key=kFp8Static128BlockSym,
+            activation_quant_key=kFp8Dynamic128Sym,
+            weight_shape=(128, 128),
+            input_dtype=torch.bfloat16,
+            out_dtype=torch.bfloat16,
         )
     else:
         obj.config = FP8ScaledMMLinearLayerConfig(
@@ -113,6 +148,58 @@ def test_bridge_marks_supporting_and_skips_others():
     layer = torch.nn.Module()
     expose_input_quant_key(layer, unsupported)
     assert not hasattr(layer, "input_quant_key")
+
+
+def test_block_kernel_apply_weights_consumes_qa():
+    """A block kernel routes a QuantizedActivation's data/scale straight into the
+    GEMM, skips self.quant_fp8, and derives output_shape from qa.orig_shape."""
+
+    class _RecordingKernel(Fp8BlockScaledMMLinearKernel):
+        @classmethod
+        def is_supported(cls, compute_capability=None):
+            return True, None
+
+        def apply_block_scaled_mm(self, A, B, As, Bs):
+            self.seen = (A, As)
+            return A.new_zeros((A.shape[0], B.shape[0]), dtype=torch.bfloat16)
+
+    kernel = _RecordingKernel.__new__(_RecordingKernel)
+    kernel.config = FP8ScaledMMLinearLayerConfig(
+        weight_quant_key=kFp8Static128BlockSym,
+        activation_quant_key=kFp8Dynamic128Sym,
+        weight_shape=(256, 128),
+        input_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+    )
+    kernel.apply_input_quant = True
+    kernel.use_triton = False
+
+    def _no_quant(*args, **kwargs):
+        raise AssertionError("quant_fp8 must not run when consuming a QA")
+
+    kernel.quant_fp8 = _no_quant
+
+    fp8 = current_platform.fp8_dtype()
+    layer = torch.nn.Module()
+    layer.weight = torch.zeros(256, 128, dtype=fp8)
+    layer.weight_scale = None
+    layer.weight_scale_inv = torch.ones(2, 1)
+
+    n_tokens, k = 4, 128
+    data = torch.zeros(n_tokens, k, dtype=fp8)
+    scale = torch.ones(n_tokens, 1)
+    qa = QuantizedActivation(
+        data=data,
+        scale=scale,
+        orig_dtype=torch.bfloat16,
+        orig_shape=torch.Size([n_tokens, k]),
+        quant_key=kFp8Dynamic128Sym,
+    )
+
+    out = kernel.apply_weights(layer, qa)
+    assert kernel.seen[0] is data
+    assert kernel.seen[1] is scale
+    assert out.shape == (n_tokens, 256)  # [*orig_shape[:-1], weight.shape[0]]
 
 
 def test_as_quantized_activation_validates_key():

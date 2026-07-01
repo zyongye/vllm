@@ -36,6 +36,7 @@ from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     make_fp8_moe_quant_config,
     select_fp8_moe_backend,
 )
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -487,6 +488,32 @@ class Fp8LinearMethod(LinearMethodBase):
                 return torch.nn.functional.linear(x, weight_bf16.t(), bias)
 
         return self.fp8_linear.apply_weights(layer, x, bias)
+
+    def quantize_activation(
+        self, layer: torch.nn.Module, x: torch.Tensor
+    ) -> torch.Tensor | QuantizedActivation:
+        """Pre-quantize ``x`` into a ``QuantizedActivation`` this layer's kernel
+        can consume directly, letting ``apply_weights`` skip its own input
+        quantization (e.g. to share one quant across several GEMMs, or hoist it
+        upstream).
+
+        Reuses the kernel's own ``quant_fp8`` so the fp8 data and scale layout
+        (column-major / ue8m0 / TMA-aligned) match exactly. Returns ``x``
+        unchanged when the kernel quantizes internally (``input_quant_key()`` is
+        ``None``), so callers can wire this unconditionally.
+        """
+        key = self.fp8_linear.input_quant_key()
+        quant_fp8 = getattr(self.fp8_linear, "quant_fp8", None)
+        if key is None or quant_fp8 is None:
+            return x
+        q, s = quant_fp8(x.view(-1, x.shape[-1]))
+        return QuantizedActivation(
+            data=q,
+            scale=s,
+            orig_dtype=x.dtype,
+            orig_shape=x.shape,
+            quant_key=key,
+        )
 
 
 class Fp8MoEMethod(FusedMoEMethodBase):
