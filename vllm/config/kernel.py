@@ -124,6 +124,7 @@ MoEBackend = Literal[
     "triton",
     "deep_gemm",
     "deep_gemm_mega_moe",
+    "deep_gemm_amxf4_mega_moe",
     "cutlass",
     "flashinfer_trtllm",
     "flashinfer_cutlass",
@@ -184,7 +185,10 @@ class KernelConfig:
     - "auto": Automatically select the best backend based on model and hardware
     - "triton": Use Triton-based fused MoE kernels
     - "deep_gemm": Use DeepGEMM kernels (FP8 block-quantized only)
-    - "deep_gemm_mega_moe": Use DeepGEMM mega MoE kernels
+    - "deep_gemm_mega_moe": Use DeepGEMM mega MoE kernels (fp8 activations)
+    - "deep_gemm_amxf4_mega_moe": Use DeepGEMM mega MoE kernels with MXFP4
+      activations (packed E2M1 dispatch; requires a DeepGEMM build with the
+      MXFP4 mega kernel)
     - "cutlass": Use vLLM CUTLASS kernels
     - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels

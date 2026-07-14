@@ -74,7 +74,7 @@ def override_envs_for_eplb(
     """
     is_data_parallel = parallel_config.data_parallel_size > 1
     is_eplb_enabled = parallel_config.enable_eplb
-    is_mega_moe = moe_backend == "deep_gemm_mega_moe"
+    is_mega_moe = moe_backend in ("deep_gemm_mega_moe", "deep_gemm_amxf4_mega_moe")
     is_nccl_based_eplb_communicator = parallel_config.eplb_config.communicator in (
         "torch_nccl",
         "pynccl",
