@@ -35,6 +35,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
@@ -98,6 +99,9 @@ from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4MLP,
 )
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.models.kimi_k3.nvidia.fused_moe_input_proj import (
+    KimiK3FusedMoEInputProj,
+)
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.nvidia.latent_moe_runner import (
     LatentMoERunner,
@@ -242,6 +246,7 @@ class KimiMLP(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.expects_gate_up_input = False
         self.shard_sequence_parallel = shard_sequence_parallel_mlp(
             hidden_size,
             intermediate_size,
@@ -250,13 +255,15 @@ class KimiMLP(nn.Module):
         )
         replicate = use_sequence_parallel and not self.shard_sequence_parallel
 
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            disable_tp=replicate,
-            prefix=f"{prefix}.gate_up_proj",
+        self.gate_up_proj: MergedColumnParallelLinear | None = (
+            MergedColumnParallelLinear(
+                hidden_size,
+                [intermediate_size] * 2,
+                bias=False,
+                quant_config=quant_config,
+                disable_tp=replicate,
+                prefix=f"{prefix}.gate_up_proj",
+            )
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -300,14 +307,42 @@ class KimiMLP(nn.Module):
                 "Only silu and situ are supported."
             )
 
+    def use_external_gate_up(self) -> bool:
+        """Drop the gate/up projection so a caller can fuse it upstream.
+
+        ``forward`` then takes the already-projected gate/up as its input. Returns
+        False, leaving the module untouched, when the projection cannot be hoisted
+        out: a quantized projection has no place in the caller's bf16 fused weight,
+        and a sequence-parallel shard needs the all-gather that precedes it here.
+        """
+        if self.expects_gate_up_input:
+            return True
+        gate_up_proj = self.gate_up_proj
+        assert gate_up_proj is not None
+        if (
+            self.shard_sequence_parallel
+            or type(gate_up_proj.quant_method) is not UnquantizedLinearMethod
+        ):
+            return False
+        self.expects_gate_up_input = True
+        self.gate_up_proj = None
+        return True
+
     def forward(self, x):
-        if self.shard_sequence_parallel:
-            # Each rank holds a weight shard but only its own tokens, so it
-            # cannot finish those tokens alone: gather the full token set,
-            # compute this rank's partial for all of them, then reduce-scatter,
-            # which sums across TP and restores the sequence sharding.
-            x = sp_all_gather(x)
-        gate_up, _ = self.gate_up_proj(x)
+        if self.expects_gate_up_input:
+            # ``x`` is the gate/up projection itself, computed upstream (see
+            # KimiK3FusedMoEInputProj).
+            gate_up = x
+        else:
+            if self.shard_sequence_parallel:
+                # Each rank holds a weight shard but only its own tokens, so it
+                # cannot finish those tokens alone: gather the full token set,
+                # compute this rank's partial for all of them, then
+                # reduce-scatter, which sums across TP and restores the sequence
+                # sharding.
+                x = sp_all_gather(x)
+            assert self.gate_up_proj is not None
+            gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
 
         if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(x):
@@ -540,6 +575,21 @@ def make_kimi_k3_mega_moe_expert_params_mapping(
     return mapping
 
 
+class KimiMoEGateBias(nn.Module):
+    """Router score-correction bias holder.
+
+    Stands in for the gate when the router weight lives in the fused MoE input
+    projection: the checkpoint's ``gate.e_score_correction_bias`` still resolves
+    by name, while ``gate.weight`` is remapped onto the fused parameter.
+    """
+
+    def __init__(self, num_experts: int) -> None:
+        super().__init__()
+        self.e_score_correction_bias = nn.Parameter(
+            torch.empty(num_experts, dtype=torch.float32)
+        )
+
+
 class KimiMoE(nn.Module):
     def __init__(
         self,
@@ -550,6 +600,7 @@ class KimiMoE(nn.Module):
         layer_idx: int = 0,
         use_sequence_parallel: bool = False,
         run_gemm_rs_ar: bool = False,
+        allow_fused_moe_input_proj: bool = True,
     ):
         super().__init__()
         hidden_size = config.hidden_size
@@ -612,21 +663,10 @@ class KimiMoE(nn.Module):
             config.activation_situ_linear_beta if config.hidden_act == "situ" else None
         )
 
-        # Route with fp32 logits for numerically stable expert selection.
-        self.gate = GateLinear(
-            input_size=hidden_size,
-            output_size=num_experts,
-            bias=False,
-            out_dtype=torch.float32,
-            prefix=f"{prefix}.gate",
+        shared_intermediate_size = moe_intermediate_size * (
+            self.num_shared_experts or 0
         )
-
-        self.gate.e_score_correction_bias = nn.Parameter(
-            torch.empty(num_experts, dtype=torch.float32)
-        )
-
         if self.num_shared_experts is not None:
-            shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
             self.shared_experts = KimiMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=shared_intermediate_size,
@@ -646,17 +686,72 @@ class KimiMoE(nn.Module):
         else:
             self.shared_experts = None
 
+        # The router gate, the routed-expert down projection and the shared
+        # experts' gate/up projection all read the same hidden states, so they
+        # can share one weight and, on small batches, one GEMM. That needs a
+        # replicated bf16 shared gate/up, and it is incompatible with sequence
+        # parallelism, which shards those activations, and with MegaMoE, which
+        # drives the shared experts itself.
+        can_fuse_moe_input_proj = (
+            allow_fused_moe_input_proj
+            and self.use_latent_moe
+            and not self.use_mega_moe
+            and not use_sequence_parallel
+            and bool(self.num_shared_experts)
+            and config.hidden_act == "situ"
+            and current_platform.is_cuda()
+            and self.shared_experts is not None
+        )
+        # Hands the shared gate/up projection over to the fused weight, or
+        # declines if it is quantized.
+        use_fused_moe_input_proj = (
+            can_fuse_moe_input_proj and self.shared_experts.use_external_gate_up()
+        )
+
+        self.gate: nn.Module
+        self.fused_moe_input_proj: KimiK3FusedMoEInputProj | None
+        if use_fused_moe_input_proj:
+            # The router weight lives in the fused projection, so the gate is
+            # only a holder for the score-correction bias.
+            self.gate = KimiMoEGateBias(num_experts)
+            self.fused_moe_input_proj = KimiK3FusedMoEInputProj(
+                hidden_size=hidden_size,
+                num_experts=num_experts,
+                latent_size=self.moe_hidden_size,
+                shared_intermediate_size=shared_intermediate_size,
+                prefix=f"{prefix}.fused_moe_input_proj",
+            )
+        else:
+            # Route with fp32 logits for numerically stable expert selection.
+            self.gate = GateLinear(
+                input_size=hidden_size,
+                output_size=num_experts,
+                bias=False,
+                out_dtype=torch.float32,
+                prefix=f"{prefix}.gate",
+            )
+            self.gate.e_score_correction_bias = nn.Parameter(
+                torch.empty(num_experts, dtype=torch.float32)
+            )
+            self.fused_moe_input_proj = None
+
         self.routed_expert_down_proj: ReplicatedLinear | None
         self.routed_expert_norm: RMSNorm | None
         self.routed_expert_up_proj: ReplicatedLinear | None
         self.routed_output_transform: KimiRoutedOutputTransform | None
         if self.use_latent_moe:
-            self.routed_expert_down_proj = ReplicatedLinear(
-                hidden_size,
-                self.moe_hidden_size,
-                bias=False,
-                quant_config=None,
-                prefix=f"{prefix}.routed_expert_down_proj",
+            # The fused input projection owns this weight; see
+            # ``use_fused_moe_input_proj`` above.
+            self.routed_expert_down_proj = (
+                None
+                if use_fused_moe_input_proj
+                else ReplicatedLinear(
+                    hidden_size,
+                    self.moe_hidden_size,
+                    bias=False,
+                    quant_config=None,
+                    prefix=f"{prefix}.routed_expert_down_proj",
+                )
             )
             self.routed_expert_norm = (
                 RMSNorm(self.moe_hidden_size, eps=config.rms_norm_eps)
@@ -741,6 +836,11 @@ class KimiMoE(nn.Module):
                 is_sequence_parallel=use_sequence_parallel,
                 runner_cls=LatentMoERunner if self.use_latent_moe else None,
             )
+            if self.use_fused_moe_input_proj:
+                # forward() passes the pre-computed gate/up through
+                # ``shared_experts_input``, so the runner can no longer read the
+                # shared experts' output width off that tensor.
+                self.experts.set_shared_experts_output_dim(hidden_size)
         if self.padded_moe_intermediate_size != moe_intermediate_size:
             w13_weight = getattr(self.experts, "w13_weight", None)
             if w13_weight is None:
@@ -755,6 +855,10 @@ class KimiMoE(nn.Module):
             self.experts.moe_config.intermediate_size_per_partition_unpadded = (
                 moe_intermediate_size // self.tp_size
             )
+
+    @property
+    def use_fused_moe_input_proj(self) -> bool:
+        return self.fused_moe_input_proj is not None
 
     def _maybe_overlap_router_and_down_proj(
         self, hidden_states: torch.Tensor
@@ -816,6 +920,22 @@ class KimiMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+
+        if self.fused_moe_input_proj is not None:
+            # One GEMM (or two above the token threshold) covers the router, the
+            # routed latent and the shared gate/up. The shared experts then run
+            # only their activation and down projection, which MoERunner
+            # overlaps with routing and the expert GEMMs on the aux stream.
+            router_logits, routed_hidden_states, shared_gate_up = (
+                self.fused_moe_input_proj.project(hidden_states)
+            )
+            final_hidden_states = self.experts(
+                hidden_states=routed_hidden_states,
+                router_logits=router_logits,
+                shared_experts_input=shared_gate_up,
+            )
+            return final_hidden_states.view(num_tokens, hidden_size)
+
         # Overlap the gate with the routed down projection; the returned hidden
         # states are already down-projected. Keep the original ``hidden_states``
         # for the shared experts.
@@ -861,6 +981,7 @@ class KimiDecoderLayer(nn.Module):
         prefix: str = "",
         aux_stream: torch.cuda.Stream | None = None,
         run_gemm_rs_ar: bool = False,
+        allow_fused_moe_input_proj: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -948,6 +1069,7 @@ class KimiDecoderLayer(nn.Module):
                 layer_idx=layer_idx,
                 use_sequence_parallel=self.use_sequence_parallel,
                 run_gemm_rs_ar=run_gemm_rs_ar,
+                allow_fused_moe_input_proj=allow_fused_moe_input_proj,
             )
             self.mlp = self.block_sparse_moe
         else:
@@ -1433,6 +1555,41 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             return hidden_states, aux_hidden_states
         return hidden_states
 
+    def _fused_moe_input_proj_params_mapping(self) -> list[tuple[str, str, int]]:
+        """Checkpoint shards feeding ``KimiK3FusedMoEInputProj``.
+
+        Empty unless the fused projection is in use. The router entry keys on
+        ``.gate.weight`` rather than ``.gate``, which is also a prefix of
+        ``.gate_proj`` and ``.gate_up_proj``.
+        """
+        fused = [
+            moe.use_fused_moe_input_proj
+            for moe in self.modules()
+            if isinstance(moe, KimiMoE)
+        ]
+        if not any(fused):
+            return []
+        if not all(fused):
+            raise ValueError(
+                "Kimi-K3's fused MoE input projection must be enabled for every "
+                "MoE layer or none of them, since weight loading maps it by name."
+            )
+        proj = ".fused_moe_input_proj"
+        return [
+            (f"{proj}.weight", ".gate.weight", KimiK3FusedMoEInputProj.ROUTER_SHARD_ID),
+            (proj, ".routed_expert_down_proj", KimiK3FusedMoEInputProj.LATENT_SHARD_ID),
+            (
+                proj,
+                ".shared_experts.gate_proj",
+                KimiK3FusedMoEInputProj.SHARED_GATE_SHARD_ID,
+            ),
+            (
+                proj,
+                ".shared_experts.up_proj",
+                KimiK3FusedMoEInputProj.SHARED_UP_SHARD_ID,
+            ),
+        ]
+
     def load_weights(
         self,
         weights: Iterable[
@@ -1446,6 +1603,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         beta_shard_id = 5 if use_full_rank_gate else 3
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
+            # Kimi-K3's fused MoE input projection. These must precede the
+            # generic .gate_proj/.up_proj entries below, which would otherwise
+            # claim the shared experts' shards.
+            *self._fused_moe_input_proj_params_mapping(),
             (".in_proj_qkvgfab", ".q_proj", 0),
             (".in_proj_qkvgfab", ".k_proj", 1),
             (".in_proj_qkvgfab", ".v_proj", 2),

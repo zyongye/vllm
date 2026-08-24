@@ -94,7 +94,13 @@ class KimiK3MultiTokenPredictorLayer(nn.Module):
         # convention: the MTP block creates its own stream).
         aux_stream = torch.cuda.Stream()
         self.mtp_block = KimiDecoderLayer(
-            block_config, vllm_config, prefix=prefix, aux_stream=aux_stream
+            block_config,
+            vllm_config,
+            prefix=prefix,
+            aux_stream=aux_stream,
+            # The draft model has its own weight loading, which does not map the
+            # fused MoE input projection's shards.
+            allow_fused_moe_input_proj=False,
         )
 
     def forward(

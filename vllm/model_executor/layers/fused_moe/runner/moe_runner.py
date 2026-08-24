@@ -280,6 +280,11 @@ class MoERunner(MoERunnerInterface):
         self._fse_fuse_gate = gate is not None and shared_expert_gate is not None
         self._combined_gate_weight: torch.Tensor | None = None
 
+        # Set when the caller passes something other than the shared experts'
+        # own input through ``shared_experts_input``; see
+        # set_shared_experts_output_dim.
+        self._shared_experts_output_dim: int | None = None
+
         self._shared_experts: SharedExperts | None = None
         if shared_experts is not None:
             can_overlap = lambda: self._quant_method.mk_can_overlap_shared_experts
@@ -319,6 +324,16 @@ class MoERunner(MoERunnerInterface):
     @property
     def shared_experts(self) -> SharedExperts | None:
         return self._shared_experts
+
+    def set_shared_experts_output_dim(self, hidden_dim: int) -> None:
+        """Declare the width of the shared experts' output.
+
+        It is normally read off ``shared_experts_input``, which is the shared
+        experts' input and so has the same width as their output. Callers that
+        pre-compute part of the shared experts and pass that through instead
+        (Kimi-K3 passes the gate/up projection) must declare the width here.
+        """
+        self._shared_experts_output_dim = hidden_dim
 
     # TODO(bnell): Temporary hack. Get rid of this.
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase):
@@ -521,9 +536,12 @@ class MoERunner(MoERunnerInterface):
         fused MoE kernel. The returned trunc_size is used by
         _maybe_reduce_final_output to strip the padding from the result.
         """
-        shared_experts_hidden_dim = (
-            shared_experts_input.shape[-1] if shared_experts_input is not None else 0
-        )
+        if shared_experts_input is None:
+            shared_experts_hidden_dim = 0
+        else:
+            shared_experts_hidden_dim = (
+                self._shared_experts_output_dim or shared_experts_input.shape[-1]
+            )
         transformed_hidden_dim: int | None = hidden_states.shape[-1]
         if (
             not self._quant_method.skip_forward_padding
