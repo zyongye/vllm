@@ -312,8 +312,9 @@ class KimiMLP(nn.Module):
 
         ``forward`` then takes the already-projected gate/up as its input. Returns
         False, leaving the module untouched, when the projection cannot be hoisted
-        out: a quantized projection has no place in the caller's bf16 fused weight,
-        and a sequence-parallel shard needs the all-gather that precedes it here.
+        out: only an unquantized bf16 weight can join the caller's bf16 fused
+        weight, and a sequence-parallel shard needs the all-gather that precedes
+        it here.
         """
         if self.expects_gate_up_input:
             return True
@@ -322,6 +323,7 @@ class KimiMLP(nn.Module):
         if (
             self.shard_sequence_parallel
             or type(gate_up_proj.quant_method) is not UnquantizedLinearMethod
+            or gate_up_proj.weight.dtype is not torch.bfloat16
         ):
             return False
         self.expects_gate_up_input = True
@@ -688,10 +690,15 @@ class KimiMoE(nn.Module):
 
         # The router gate, the routed-expert down projection and the shared
         # experts' gate/up projection all read the same hidden states, so they
-        # can share one weight and, on small batches, one GEMM. That needs a
-        # replicated bf16 shared gate/up, and it is incompatible with sequence
-        # parallelism, which shards those activations, and with MegaMoE, which
-        # drives the shared experts itself.
+        # can share one weight and, on small batches, one GEMM. It is
+        # incompatible with sequence parallelism, which shards those
+        # activations, and with MegaMoE, which drives the shared experts itself.
+        #
+        # All three have to be unquantized bf16, since they become one bf16
+        # weight feeding cuBLAS' bf16 x bf16 -> fp32 GEMM. The router and the
+        # latent down projection are built with ``quant_config=None`` from the
+        # model dtype, so that dtype settles both; the shared gate/up carries
+        # the checkpoint's quant config and checks itself below.
         can_fuse_moe_input_proj = (
             allow_fused_moe_input_proj
             and self.use_latent_moe
@@ -700,10 +707,11 @@ class KimiMoE(nn.Module):
             and bool(self.num_shared_experts)
             and config.hidden_act == "situ"
             and current_platform.is_cuda()
+            and vllm_config.model_config.dtype is torch.bfloat16
             and self.shared_experts is not None
         )
         # Hands the shared gate/up projection over to the fused weight, or
-        # declines if it is quantized.
+        # declines if it is quantized or not bf16.
         use_fused_moe_input_proj = (
             can_fuse_moe_input_proj and self.shared_experts.use_external_gate_up()
         )

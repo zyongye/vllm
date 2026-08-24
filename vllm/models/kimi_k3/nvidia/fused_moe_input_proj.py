@@ -59,6 +59,9 @@ class KimiK3FusedMoEInputProj(MergedColumnParallelLinear):
     merged shard offsets line up while each rank stores the full copy; loading
     them forces ``tp_rank = 0``. Same trick as
     ``_KimiGDNMergedColumnParallelLinear`` in ``kda.py``.
+
+    All three projections must be unquantized bf16 for this to be built; see
+    ``KimiMoE.__init__``.
     """
 
     ROUTER_SHARD_ID = 0
