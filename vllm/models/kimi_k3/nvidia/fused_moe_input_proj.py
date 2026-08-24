@@ -154,6 +154,10 @@ class KimiK3FusedMoEInputProj(MergedColumnParallelLinear):
             # stable expert selection. The other two blocks are rounded back to
             # the activation dtype in _materialize.
             fused = torch.mm(hidden_states, weight.t(), out_dtype=torch.float32)
+            # Load-bearing: flashinfer's TRT-LLM routing kernel reads
+            # ``scores + tokenIdx * numExperts`` with no stride field, and
+            # neither its FFI layer nor its Python wrapper checks contiguity, so
+            # a row-strided view reads the neighbouring blocks' data silently.
             router_logits = fused[:, :num_experts].contiguous()
             latent = _materialize(fused[:, num_experts:latent_end], hidden_states.dtype)
             shared_gate_up = _materialize(fused[:, latent_end:], hidden_states.dtype)
