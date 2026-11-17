@@ -33,6 +33,13 @@ ARG TRITON_INSTALL_FROM_SOURCE_REVISION=
 # runtime NCCL versions compatible.
 # DeepEPv2 GDA over EFA requires NCCL 2.31.x or later.
 ARG NCCL_VERSION=2.31.2
+# cuBLAS 13.4 slows FlashInfer's small-batch MoE routing kernel
+# (routingIndicesDynBlockKernel, ~5 -> ~13 us per layer) when it is first
+# used after cuBLAS in a process with a cold CUDA kernel cache, which is
+# the vLLM worker's order. Pin the runtime cuBLAS for CUDA 13 builds
+# (not Rubin prerelease builds); set to empty to take the version torch
+# resolves.
+ARG CUBLAS_VERSION=13.1.1.3
 # AWS EFA userspace (libfabric, aws-ofi-nccl), installed with the KV connectors.
 ARG EFA_INSTALLER_VERSION=1.51.0
 ARG EFA_INSTALLER_SHA256=83993044fa4df3dc2f8b5c2f7051d61b9689441be023a2c92ea51d3f53f2465c
@@ -763,6 +770,7 @@ ARG max_jobs=2
 ARG CUDA_VERSION
 ARG PYTHON_VERSION
 ARG NCCL_VERSION
+ARG CUBLAS_VERSION
 ARG DEADSNAKES_MIRROR_URL
 ARG DEADSNAKES_GPGKEY_URL
 ARG GET_PIP_URL
@@ -877,13 +885,17 @@ RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" \
 
 # DeepEPv2 GIN requires NCCL >= 2.30.4 at both compile and runtime. torch pins
 # an older version as a transitive dep; this override forces uv to use our
-# pinned version whenever nvidia-nccl-cu* is resolved.
+# pinned version whenever nvidia-nccl-cu* is resolved. cuBLAS is pinned the
+# same way (see CUBLAS_VERSION).
 RUN CUDA_MAJOR=$(echo $CUDA_VERSION | cut -d. -f1) && \
+    : > /etc/uv-overrides.txt && \
     if [ -n "$NCCL_VERSION" ]; then \
         echo "nvidia-nccl-cu${CUDA_MAJOR}==${NCCL_VERSION}" \
-            > /etc/uv-overrides.txt; \
-    else \
-        touch /etc/uv-overrides.txt; \
+            >> /etc/uv-overrides.txt; \
+    fi && \
+    if [ -n "$CUBLAS_VERSION" ] && [ "$CUDA_MAJOR" = "13" ] && \
+        [ "$INSTALL_RUBIN_PRERELEASE" != "true" ]; then \
+        echo "nvidia-cublas==${CUBLAS_VERSION}" >> /etc/uv-overrides.txt; \
     fi
 ENV UV_OVERRIDE=/etc/uv-overrides.txt
 

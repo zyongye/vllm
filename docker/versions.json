@@ -16,6 +16,9 @@
     "NCCL_VERSION": {
       "default": "2.31.2"
     },
+    "CUBLAS_VERSION": {
+      "default": "13.1.1.3"
+    },
     "EFA_INSTALLER_VERSION": {
       "default": "1.51.0"
     },
