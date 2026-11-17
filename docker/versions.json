@@ -2,7 +2,10 @@
   "_comment": "Auto-generated from Dockerfile ARGs. Do not edit manually. Run: python tools/generate_versions_json.py",
   "variable": {
     "CUDA_VERSION": {
-      "default": "13.2.1"
+      "default": "13.4.2"
+    },
+    "TORCH_CUDA_VERSION": {
+      "default": "13.2"
     },
     "PYTHON_VERSION": {
       "default": "3.12"
@@ -26,10 +29,10 @@
       "default": "83993044fa4df3dc2f8b5c2f7051d61b9689441be023a2c92ea51d3f53f2465c"
     },
     "BUILD_BASE_IMAGE": {
-      "default": "pytorch/manylinux2_28-builder:cuda13.2-9f3983c9d680f3cc243dfa0524efcb881be7869e"
+      "default": "pytorch/manylinux2_28-builder:cuda13.4-ece1a2070114150c464bdefbb1d0156d38ce888a"
     },
     "FINAL_BASE_IMAGE": {
-      "default": "nvidia/cuda:13.2.1-base-ubuntu24.04"
+      "default": "nvidia/cuda:13.4.2-base-ubuntu24.04"
     },
     "GET_PIP_URL": {
       "default": "https://bootstrap.pypa.io/get-pip.py"

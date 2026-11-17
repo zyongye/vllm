@@ -251,6 +251,7 @@ steps:
               --build-arg USE_SCCACHE=1 \
               --build-arg GIT_REPO_CHECK=1 \
               --build-arg CUDA_VERSION=13.5 \
+              --build-arg TORCH_CUDA_VERSION=13.4 \
               --build-arg torch_cuda_arch_list="${CUDA_ARCH_X86}" \
               --build-arg INSTALL_KV_CONNECTORS=true \
               --build-arg INSTALL_RUBIN_PRERELEASE=true \
@@ -282,6 +283,7 @@ steps:
               --build-arg USE_SCCACHE=1 \
               --build-arg GIT_REPO_CHECK=1 \
               --build-arg CUDA_VERSION=13.5 \
+              --build-arg TORCH_CUDA_VERSION=13.4 \
               --build-arg torch_cuda_arch_list="${CUDA_ARCH_AARCH64}" \
               --build-arg INSTALL_KV_CONNECTORS=true \
               --build-arg INSTALL_RUBIN_PRERELEASE=true \
