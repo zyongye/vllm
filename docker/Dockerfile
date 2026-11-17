@@ -1000,16 +1000,30 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # With cuBLAS pinned, the toolkit ships no cuBLAS: expose the wheel's headers
 # and libraries under CUDA_HOME so JIT builds that use cuBLAS/cuBLASLt
 # compile and link against the same version torch loads.
+# Every CUDA 13 wheel installs into the same nvidia/cu13 tree, so link only
+# the headers listed in nvidia-cublas's own RECORD. Linking the whole include
+# directory would replace the toolkit's cuda_runtime*.h and cuda.h with the
+# torch wheels' older ones, and nvcc then rejects every JIT build ("CUDA
+# compiler and CUDA toolkit headers are incompatible").
 RUN if grep -q '^nvidia-cublas==' /etc/uv-overrides.txt; then \
         CUBLAS_ROOT=$(python3 -c "import importlib.metadata as m; \
 print(m.distribution('nvidia-cublas').locate_file('nvidia/cu13'))") && \
-        ln -sf "${CUBLAS_ROOT}"/include/*.h /usr/local/cuda/include/ && \
+        CUBLAS_HEADERS=$(python3 -c "import importlib.metadata as m; \
+d = m.distribution('nvidia-cublas'); \
+print(*sorted(str(d.locate_file(f)) for f in d.files if f.suffix == '.h'))") && \
+        test -n "${CUBLAS_HEADERS}" && \
+        ln -sf -t /usr/local/cuda/include/ ${CUBLAS_HEADERS} && \
         for lib in libcublas libcublasLt; do \
             ln -sf "${CUBLAS_ROOT}/lib/${lib}.so.13" /usr/local/cuda/lib64/${lib}.so.13 && \
             ln -sf ${lib}.so.13 /usr/local/cuda/lib64/${lib}.so; \
         done && \
-        ls -l /usr/local/cuda/lib64/libcublas*; \
-    fi
+        ls -l /usr/local/cuda/lib64/libcublas* && \
+        ls -l /usr/local/cuda/include/ | grep -- '->'; \
+    fi && \
+    printf '#include <cuda_runtime.h>\n#include <cuda/std/cstdint>\n#include <cublasLt.h>\nint main() { return 0; }\n' \
+        > /tmp/cuda-headers-check.cu && \
+    nvcc -c /tmp/cuda-headers-check.cu -o /tmp/cuda-headers-check.o && \
+    rm -f /tmp/cuda-headers-check.cu /tmp/cuda-headers-check.o
 
 # Install FlashInfer's precompiled kernels for all GPU architectures (the default).
 # `vllm download-kernels` wraps this command but vLLM is only installed in later
