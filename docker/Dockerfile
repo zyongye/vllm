@@ -835,9 +835,28 @@ RUN apt-get update -y \
     && curl -sS ${GET_PIP_URL} | python${PYTHON_VERSION} \
     && python3 --version && python3 -m pip --version
 
+# DeepEPv2 GIN requires NCCL >= 2.30.4 at both compile and runtime. torch pins
+# an older version as a transitive dep; this override forces uv to use our
+# pinned version whenever nvidia-nccl-cu* is resolved. cuBLAS is pinned the
+# same way (see CUBLAS_VERSION); later steps check this file to keep the
+# CUDA toolkit's cuBLAS out of the image.
+RUN CUDA_MAJOR=$(echo $CUDA_VERSION | cut -d. -f1) && \
+    : > /etc/uv-overrides.txt && \
+    if [ -n "$NCCL_VERSION" ]; then \
+        echo "nvidia-nccl-cu${CUDA_MAJOR}==${NCCL_VERSION}" \
+            >> /etc/uv-overrides.txt; \
+    fi && \
+    if [ -n "$CUBLAS_VERSION" ] && [ "$CUDA_MAJOR" = "13" ] && \
+        [ "$INSTALL_RUBIN_PRERELEASE" != "true" ]; then \
+        echo "nvidia-cublas==${CUBLAS_VERSION}" >> /etc/uv-overrides.txt; \
+    fi
+ENV UV_OVERRIDE=/etc/uv-overrides.txt
+
 # Install CUDA development tools for runtime JIT compilation
 # (FlashInfer, DeepGEMM, EP kernels all require compilation at runtime)
 RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
+    CUBLAS_DEV=libcublas-dev-${CUDA_VERSION_DASH} && \
+    if grep -q '^nvidia-cublas==' /etc/uv-overrides.txt; then CUBLAS_DEV=; fi && \
     apt-get update -y && \
     apt-get install -y --no-install-recommends --allow-change-held-packages \
         cuda-nvcc-${CUDA_VERSION_DASH} \
@@ -848,7 +867,8 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
         cuda-nvrtc-dev-${CUDA_VERSION_DASH} \
         cuda-cuobjdump-${CUDA_VERSION_DASH} \
         libcurand-dev-${CUDA_VERSION_DASH} \
-        libcublas-dev-${CUDA_VERSION_DASH} \
+        # Linked from the pinned nvidia-cublas wheel instead when pinned.
+        ${CUBLAS_DEV} \
         # Required by fastsafetensors (fixes #20384)
         libnuma-dev \
         # numactl CLI for NUMA binding at runtime
@@ -896,22 +916,6 @@ ENV UV_COMPILE_BYTECODE=1
 RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" \
     && chgrp -R 0 /opt/uv \
     && chmod -R g+rwX,a+rX /opt/uv
-
-# DeepEPv2 GIN requires NCCL >= 2.30.4 at both compile and runtime. torch pins
-# an older version as a transitive dep; this override forces uv to use our
-# pinned version whenever nvidia-nccl-cu* is resolved. cuBLAS is pinned the
-# same way (see CUBLAS_VERSION).
-RUN CUDA_MAJOR=$(echo $CUDA_VERSION | cut -d. -f1) && \
-    : > /etc/uv-overrides.txt && \
-    if [ -n "$NCCL_VERSION" ]; then \
-        echo "nvidia-nccl-cu${CUDA_MAJOR}==${NCCL_VERSION}" \
-            >> /etc/uv-overrides.txt; \
-    fi && \
-    if [ -n "$CUBLAS_VERSION" ] && [ "$CUDA_MAJOR" = "13" ] && \
-        [ "$INSTALL_RUBIN_PRERELEASE" != "true" ]; then \
-        echo "nvidia-cublas==${CUBLAS_VERSION}" >> /etc/uv-overrides.txt; \
-    fi
-ENV UV_OVERRIDE=/etc/uv-overrides.txt
 
 # ----------------------------------------------------------------------
 # Non-root support (opt-in)
@@ -992,6 +996,20 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             --index-strategy unsafe-first-match; \
     fi && \
     rm /tmp/requirements-cuda.txt /tmp/common.txt
+
+# With cuBLAS pinned, the toolkit ships no cuBLAS: expose the wheel's headers
+# and libraries under CUDA_HOME so JIT builds that use cuBLAS/cuBLASLt
+# compile and link against the same version torch loads.
+RUN if grep -q '^nvidia-cublas==' /etc/uv-overrides.txt; then \
+        CUBLAS_ROOT=$(python3 -c "import importlib.metadata as m; \
+print(m.distribution('nvidia-cublas').locate_file('nvidia/cu13'))") && \
+        ln -sf "${CUBLAS_ROOT}"/include/*.h /usr/local/cuda/include/ && \
+        for lib in libcublas libcublasLt; do \
+            ln -sf "${CUBLAS_ROOT}/lib/${lib}.so.13" /usr/local/cuda/lib64/${lib}.so.13 && \
+            ln -sf ${lib}.so.13 /usr/local/cuda/lib64/${lib}.so; \
+        done && \
+        ls -l /usr/local/cuda/lib64/libcublas*; \
+    fi
 
 # Install FlashInfer's precompiled kernels for all GPU architectures (the default).
 # `vllm download-kernels` wraps this command but vLLM is only installed in later
@@ -1326,6 +1344,11 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     BUILD_PKGS="libcusparse-dev-${CUDA_VERSION_DASH} \
                 libcublas-dev-${CUDA_VERSION_DASH} \
                 libcusolver-dev-${CUDA_VERSION_DASH}"; \
+    # The pinned cuBLAS is already linked into CUDA_HOME; installing and
+    # purging the toolkit's would replace and then delete those links.
+    if grep -q '^nvidia-cublas==' /etc/uv-overrides.txt; then \
+        BUILD_PKGS=$(echo ${BUILD_PKGS} | sed "s/libcublas-dev-${CUDA_VERSION_DASH}//"); \
+    fi; \
     if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
         KV_REQUIREMENTS=/tmp/vllm-requirements/kv_connectors.txt; \
         if [ "${CUDA_MAJOR}" = "12" ]; then \
